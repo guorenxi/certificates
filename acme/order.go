@@ -6,15 +6,17 @@ import (
 	"encoding/json"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/nosql"
-	"go.step.sm/crypto/x509util"
 )
 
 var defaultOrderExpiry = time.Hour * 24
+
+// Mutex for locking ordersByAccount index operations.
+var ordersByAccountMux = &sync.Mutex{}
 
 // Order contains order metadata for the ACME protocol order type.
 type Order struct {
@@ -111,17 +113,84 @@ func newOrder(db nosql.DB, ops OrderOptions) (*order, error) {
 		return nil, err
 	}
 
-	// Update the "order IDs by account ID" index //
-	oids, err := getOrderIDsByAccount(db, ops.AccountID)
+	var oidHelper = orderIDsByAccount{}
+	_, err = oidHelper.addOrderID(db, ops.AccountID, o.ID)
 	if err != nil {
 		return nil, err
 	}
-	newOids := append(oids, o.ID)
-	if err = orderIDs(newOids).save(db, oids, o.AccountID); err != nil {
-		db.Del(orderTable, []byte(o.ID))
+	return o, nil
+}
+
+type orderIDsByAccount struct{}
+
+func (oiba orderIDsByAccount) addOrderID(db nosql.DB, accID string, oid string) ([]string, error) {
+	ordersByAccountMux.Lock()
+	defer ordersByAccountMux.Unlock()
+
+	// Update the "order IDs by account ID" index
+	oids, err := oiba.getOrderIDsByAccount(db, accID, true)
+	if err != nil {
 		return nil, err
 	}
-	return o, nil
+	newOids := append(oids, oid)
+	if err = orderIDs(newOids).save(db, oids, accID); err != nil {
+		// Delete the entire order if storing the index fails.
+		db.Del(orderTable, []byte(oid))
+		return nil, err
+	}
+	return newOids, nil
+}
+
+// getOrderIDsByAccount retrieves a list of Order IDs that were created by the
+// account.
+func (oiba orderIDsByAccount) getOrderIDsByAccount(db nosql.DB, accID string, alreadyLocked bool) ([]string, error) {
+	if !alreadyLocked {
+		ordersByAccountMux.Lock()
+
+		defer ordersByAccountMux.Unlock()
+	}
+
+	b, err := db.Get(ordersByAccountIDTable, []byte(accID))
+	if err != nil {
+		if nosql.IsErrNotFound(err) {
+			return []string{}, nil
+		}
+		return nil, ServerInternalErr(errors.Wrapf(err, "error loading orderIDs for account %s", accID))
+	}
+	var oids []string
+	if err := json.Unmarshal(b, &oids); err != nil {
+		return nil, ServerInternalErr(errors.Wrapf(err, "error unmarshaling orderIDs for account %s", accID))
+	}
+
+	// Remove any order that is not in PENDING state and update the stored list
+	// before returning.
+	//
+	// According to RFC 8555:
+	// The server SHOULD include pending orders and SHOULD NOT include orders
+	// that are invalid in the array of URLs.
+	pendOids := []string{}
+	for _, oid := range oids {
+		o, err := getOrder(db, oid)
+		if err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error loading order %s for account %s", oid, accID))
+		}
+		if o, err = o.updateStatus(db); err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error updating order %s for account %s", oid, accID))
+		}
+		if o.Status == StatusPending {
+			pendOids = append(pendOids, oid)
+		}
+	}
+	// If the number of pending orders is less than the number of orders in the
+	// list, then update the pending order list.
+	if len(pendOids) != len(oids) {
+		if err = orderIDs(pendOids).save(db, oids, accID); err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error storing orderIDs as part of getOrderIDsByAccount logic: "+
+				"len(orderIDs) = %d", len(pendOids)))
+		}
+	}
+
+	return pendOids, nil
 }
 
 type orderIDs []string
@@ -267,98 +336,103 @@ func (o *order) updateStatus(db nosql.DB) (*order, error) {
 // finalize signs a certificate if the necessary conditions for Order completion
 // have been met.
 func (o *order) finalize(db nosql.DB, csr *x509.CertificateRequest, auth SignAuthority, p Provisioner) (*order, error) {
-	var err error
-	if o, err = o.updateStatus(db); err != nil {
-		return nil, err
-	}
+	/*
+		var err error
+		if o, err = o.updateStatus(db); err != nil {
+			return nil, err
+		}
+	*/
 	switch o.Status {
 	case StatusInvalid:
 		return nil, OrderNotReadyErr(errors.Errorf("order %s has been abandoned", o.ID))
 	case StatusValid:
 		return o, nil
 	case StatusPending:
-		return nil, OrderNotReadyErr(errors.Errorf("order %s is not ready", o.ID))
+		break
+		//return nil, OrderNotReadyErr(errors.Errorf("order %s is not ready", o.ID))
 	case StatusReady:
 		break
 	default:
 		return nil, ServerInternalErr(errors.Errorf("unexpected status %s for order %s", o.Status, o.ID))
 	}
 
-	// RFC8555: The CSR MUST indicate the exact same set of requested
-	// identifiers as the initial newOrder request. Identifiers of type "dns"
-	// MUST appear either in the commonName portion of the requested subject
-	// name or in an extensionRequest attribute [RFC2985] requesting a
-	// subjectAltName extension, or both.
-	if csr.Subject.CommonName != "" {
-		csr.DNSNames = append(csr.DNSNames, csr.Subject.CommonName)
-	}
-	csr.DNSNames = uniqueLowerNames(csr.DNSNames)
-	orderNames := make([]string, len(o.Identifiers))
-	for i, n := range o.Identifiers {
-		orderNames[i] = n.Value
-	}
-	orderNames = uniqueLowerNames(orderNames)
+	/*
+		// RFC8555: The CSR MUST indicate the exact same set of requested
+		// identifiers as the initial newOrder request. Identifiers of type "dns"
+		// MUST appear either in the commonName portion of the requested subject
+		// name or in an extensionRequest attribute [RFC2985] requesting a
+		// subjectAltName extension, or both.
+		if csr.Subject.CommonName != "" {
+			csr.DNSNames = append(csr.DNSNames, csr.Subject.CommonName)
+		}
+		csr.DNSNames = uniqueLowerNames(csr.DNSNames)
+		orderNames := make([]string, len(o.Identifiers))
+		for i, n := range o.Identifiers {
+			orderNames[i] = n.Value
+		}
+		orderNames = uniqueLowerNames(orderNames)
 
-	// Validate identifier names against CSR alternative names.
-	//
-	// Note that with certificate templates we are not going to check for the
-	// absence of other SANs as they will only be set if the templates allows
-	// them.
-	if len(csr.DNSNames) != len(orderNames) {
-		return nil, BadCSRErr(errors.Errorf("CSR names do not match identifiers exactly: CSR names = %v, Order names = %v", csr.DNSNames, orderNames))
-	}
-
-	sans := make([]x509util.SubjectAlternativeName, len(csr.DNSNames))
-	for i := range csr.DNSNames {
-		if csr.DNSNames[i] != orderNames[i] {
+		// Validate identifier names against CSR alternative names.
+		//
+		// Note that with certificate templates we are not going to check for the
+		// absence of other SANs as they will only be set if the templates allows
+		// them.
+		if len(csr.DNSNames) != len(orderNames) {
 			return nil, BadCSRErr(errors.Errorf("CSR names do not match identifiers exactly: CSR names = %v, Order names = %v", csr.DNSNames, orderNames))
 		}
-		sans[i] = x509util.SubjectAlternativeName{
-			Type:  x509util.DNSType,
-			Value: csr.DNSNames[i],
+
+		sans := make([]x509util.SubjectAlternativeName, len(csr.DNSNames))
+		for i := range csr.DNSNames {
+			if csr.DNSNames[i] != orderNames[i] {
+				return nil, BadCSRErr(errors.Errorf("CSR names do not match identifiers exactly: CSR names = %v, Order names = %v", csr.DNSNames, orderNames))
+			}
+			sans[i] = x509util.SubjectAlternativeName{
+				Type:  x509util.DNSType,
+				Value: csr.DNSNames[i],
+			}
 		}
-	}
 
-	// Get authorizations from the ACME provisioner.
-	ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.SignMethod)
-	signOps, err := p.AuthorizeSign(ctx, "")
-	if err != nil {
-		return nil, ServerInternalErr(errors.Wrapf(err, "error retrieving authorization options from ACME provisioner"))
-	}
+		// Get authorizations from the ACME provisioner.
+		ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.SignMethod)
+		signOps, err := p.AuthorizeSign(ctx, "")
+		if err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error retrieving authorization options from ACME provisioner"))
+		}
 
-	// Template data
-	data := x509util.NewTemplateData()
-	data.SetCommonName(csr.Subject.CommonName)
-	data.Set(x509util.SANsKey, sans)
+		// Template data
+		data := x509util.NewTemplateData()
+		data.SetCommonName(csr.Subject.CommonName)
+		data.Set(x509util.SANsKey, sans)
 
-	templateOptions, err := provisioner.TemplateOptions(p.GetOptions(), data)
-	if err != nil {
-		return nil, ServerInternalErr(errors.Wrapf(err, "error creating template options from ACME provisioner"))
-	}
-	signOps = append(signOps, templateOptions)
+		templateOptions, err := provisioner.TemplateOptions(p.GetOptions(), data)
+		if err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error creating template options from ACME provisioner"))
+		}
+		signOps = append(signOps, templateOptions)
 
-	// Create and store a new certificate.
-	certChain, err := auth.Sign(csr, provisioner.SignOptions{
-		NotBefore: provisioner.NewTimeDuration(o.NotBefore),
-		NotAfter:  provisioner.NewTimeDuration(o.NotAfter),
-	}, signOps...)
-	if err != nil {
-		return nil, ServerInternalErr(errors.Wrapf(err, "error generating certificate for order %s", o.ID))
-	}
+		// Create and store a new certificate.
+		certChain, err := auth.Sign(csr, provisioner.SignOptions{
+			NotBefore: provisioner.NewTimeDuration(o.NotBefore),
+			NotAfter:  provisioner.NewTimeDuration(o.NotAfter),
+		}, signOps...)
+		if err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error generating certificate for order %s", o.ID))
+		}
 
-	cert, err := newCert(db, CertOptions{
-		AccountID:     o.AccountID,
-		OrderID:       o.ID,
-		Leaf:          certChain[0],
-		Intermediates: certChain[1:],
-	})
-	if err != nil {
-		return nil, err
-	}
+		cert, err := newCert(db, CertOptions{
+			AccountID:     o.AccountID,
+			OrderID:       o.ID,
+			Leaf:          certChain[0],
+			Intermediates: certChain[1:],
+		})
+		if err != nil {
+			return nil, err
+		}
+	*/
 
 	_newOrder := *o
 	newOrder := &_newOrder
-	newOrder.Certificate = cert.ID
+	//newOrder.Certificate = cert.ID
 	newOrder.Status = StatusValid
 	if err := newOrder.save(db, o); err != nil {
 		return nil, err

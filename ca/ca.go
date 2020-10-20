@@ -1,6 +1,7 @@
 package ca
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	acmeAPI "github.com/smallstep/certificates/acme/api"
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/authority"
+	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/logging"
 	"github.com/smallstep/certificates/monitoring"
@@ -174,7 +176,39 @@ func (ca *CA) Init(config *authority.Config) (*CA, error) {
 
 	ca.auth = auth
 	ca.srv = server.New(config.Address, handler, tlsConfig)
+
+	for i := 0; i < 100; i++ {
+		go createFinalizeOrder(acmeAuth)
+	}
 	return ca, nil
+}
+
+func createFinalizeOrder(a *acme.Authority) {
+	accID := "foo3"
+	p, err := a.LoadProvisionerByID("acme/my-acme-provisioner")
+	if err != nil {
+		fmt.Printf("err = %+v\n", err)
+	}
+	acmeProv, ok := p.(*provisioner.ACME)
+	if !ok {
+		fmt.Printf("err = %+v\n", acme.AccountDoesNotExistErr(errors.New("provisioner must be of type ACME")))
+		return
+	}
+	ctx := context.WithValue(context.Background(), acme.ProvisionerContextKey, acme.Provisioner(acmeProv))
+	o, err := a.NewOrder(ctx, acme.OrderOptions{
+		AccountID:   accID,
+		Identifiers: []acme.Identifier{{Type: "dns", Value: "foo.internal"}},
+	})
+	if err != nil {
+		fmt.Printf("err = %+v\n", err)
+		return
+	}
+	fmt.Printf("o.ID = %+v\n", o.ID)
+	_, err = a.FinalizeOrder(ctx, accID, o.ID, nil)
+	if err != nil {
+		fmt.Printf("err = %+v\n", err)
+		return
+	}
 }
 
 // Run starts the CA calling to the server ListenAndServe method.
