@@ -9,7 +9,7 @@ import (
 	"os"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/authority"
+	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/pki"
@@ -162,18 +162,22 @@ func onboardAction(ctx *cli.Context) error {
 	return nil
 }
 
-func onboardPKI(config onboardingConfiguration) (*authority.Config, string, error) {
+func onboardPKI(config onboardingConfiguration) (*config.Config, string, error) {
+	var opts = []pki.Option{
+		pki.WithAddress(config.Address),
+		pki.WithDNSNames([]string{config.DNS}),
+		pki.WithProvisioner("admin"),
+	}
+
 	p, err := pki.New(apiv1.Options{
 		Type:      apiv1.SoftCAS,
 		IsCreator: true,
-	})
+	}, opts...)
 	if err != nil {
 		return nil, "", err
 	}
 
-	p.SetAddress(config.Address)
-	p.SetDNSNames([]string{config.DNS})
-
+	// Generate pki
 	ui.Println("Generating root certificate...")
 	root, err := p.GenerateRootCertificate(config.Name, config.Name, config.Name, config.password)
 	if err != nil {
@@ -186,8 +190,12 @@ func onboardPKI(config onboardingConfiguration) (*authority.Config, string, erro
 		return nil, "", err
 	}
 
+	// Write files to disk
+	if err = p.WriteFiles(); err != nil {
+		return nil, "", err
+	}
+
 	// Generate provisioner
-	p.SetProvisioner("admin")
 	ui.Println("Generating admin provisioner...")
 	if err = p.GenerateKeyPairs(config.password); err != nil {
 		return nil, "", err

@@ -6,6 +6,7 @@ import (
 	"crypto"
 	"crypto/dsa" //nolint
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -429,6 +430,7 @@ type mockProvisioner struct {
 	ret1, ret2, ret3   interface{}
 	err                error
 	getID              func() string
+	getIDForToken      func() string
 	getTokenID         func(string) (string, error)
 	getName            func() string
 	getType            func() provisioner.Type
@@ -447,6 +449,13 @@ type mockProvisioner struct {
 func (m *mockProvisioner) GetID() string {
 	if m.getID != nil {
 		return m.getID()
+	}
+	return m.ret1.(string)
+}
+
+func (m *mockProvisioner) GetIDForToken() string {
+	if m.getIDForToken != nil {
+		return m.getIDForToken()
 	}
 	return m.ret1.(string)
 }
@@ -552,7 +561,7 @@ type mockAuthority struct {
 	renew                        func(cert *x509.Certificate) ([]*x509.Certificate, error)
 	rekey                        func(oldCert *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error)
 	loadProvisionerByCertificate func(cert *x509.Certificate) (provisioner.Interface, error)
-	loadProvisionerByID          func(provID string) (provisioner.Interface, error)
+	loadProvisionerByName        func(name string) (provisioner.Interface, error)
 	getProvisioners              func(nextCursor string, limit int) (provisioner.List, string, error)
 	revoke                       func(context.Context, *authority.RevokeOptions) error
 	getEncryptedKey              func(kid string) (string, error)
@@ -632,9 +641,9 @@ func (m *mockAuthority) LoadProvisionerByCertificate(cert *x509.Certificate) (pr
 	return m.ret1.(provisioner.Interface), m.err
 }
 
-func (m *mockAuthority) LoadProvisionerByID(provID string) (provisioner.Interface, error) {
-	if m.loadProvisionerByID != nil {
-		return m.loadProvisionerByID(provID)
+func (m *mockAuthority) LoadProvisionerByName(name string) (provisioner.Interface, error) {
+	if m.loadProvisionerByName != nil {
+		return m.loadProvisionerByName(name)
 	}
 	return m.ret1.(provisioner.Interface), m.err
 }
@@ -1285,6 +1294,10 @@ func Test_fmtPublicKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var dsa2048 dsa.PrivateKey
 	if err := dsa.GenerateParameters(&dsa2048.Parameters, rand.Reader, dsa.L2048N256); err != nil {
 		t.Fatal(err)
@@ -1304,6 +1317,7 @@ func Test_fmtPublicKey(t *testing.T) {
 	}{
 		{"p256", args{p256.Public(), p256, nil}, "ECDSA P-256"},
 		{"rsa1024", args{rsa1024.Public(), rsa1024, nil}, "RSA 1024"},
+		{"ed25519", args{edPub, edPriv, nil}, "Ed25519"},
 		{"dsa2048", args{cert: &x509.Certificate{PublicKeyAlgorithm: x509.DSA, PublicKey: &dsa2048.PublicKey}}, "DSA 2048"},
 		{"unknown", args{cert: &x509.Certificate{PublicKeyAlgorithm: x509.ECDSA, PublicKey: []byte("12345678")}}, "ECDSA unknown"},
 	}

@@ -590,69 +590,6 @@ func TestSSHConfig_Validate(t *testing.T) {
 	}
 }
 
-func TestSSHPublicKey_Validate(t *testing.T) {
-	key, err := jose.GenerateJWK("EC", "P-256", "", "sig", "", 0)
-	assert.FatalError(t, err)
-
-	type fields struct {
-		Type      string
-		Federated bool
-		Key       jose.JSONWebKey
-	}
-	tests := []struct {
-		name    string
-		fields  fields
-		wantErr bool
-	}{
-		{"user", fields{"user", true, key.Public()}, false},
-		{"host", fields{"host", false, key.Public()}, false},
-		{"empty", fields{"", true, key.Public()}, true},
-		{"badType", fields{"bad", false, key.Public()}, true},
-		{"badKey", fields{"user", false, *key}, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			k := &SSHPublicKey{
-				Type:      tt.fields.Type,
-				Federated: tt.fields.Federated,
-				Key:       tt.fields.Key,
-			}
-			if err := k.Validate(); (err != nil) != tt.wantErr {
-				t.Errorf("SSHPublicKey.Validate() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestSSHPublicKey_PublicKey(t *testing.T) {
-	key, err := jose.GenerateJWK("EC", "P-256", "", "sig", "", 0)
-	assert.FatalError(t, err)
-	pub, err := ssh.NewPublicKey(key.Public().Key)
-	assert.FatalError(t, err)
-
-	type fields struct {
-		publicKey ssh.PublicKey
-	}
-	tests := []struct {
-		name   string
-		fields fields
-		want   ssh.PublicKey
-	}{
-		{"ok", fields{pub}, pub},
-		{"nil", fields{nil}, nil},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			k := &SSHPublicKey{
-				publicKey: tt.fields.publicKey,
-			}
-			if got := k.PublicKey(); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("SSHPublicKey.PublicKey() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestAuthority_GetSSHBastion(t *testing.T) {
 	bastion := &Bastion{
 		Hostname: "bastion.local",
@@ -813,6 +750,11 @@ func TestAuthority_RekeySSH(t *testing.T) {
 	now := time.Now().UTC()
 
 	a := testAuthority(t)
+	a.db = &db.MockAuthDB{
+		MIsSSHRevoked: func(sn string) (bool, error) {
+			return false, nil
+		},
+	}
 
 	type test struct {
 		auth       *Authority
@@ -826,6 +768,56 @@ func TestAuthority_RekeySSH(t *testing.T) {
 		code       int
 	}
 	tests := map[string]func(t *testing.T) *test{
+		"fail/is-revoked": func(t *testing.T) *test {
+			auth := testAuthority(t)
+			auth.db = &db.MockAuthDB{
+				MIsSSHRevoked: func(sn string) (bool, error) {
+					return true, nil
+				},
+			}
+			return &test{
+				auth:       auth,
+				userSigner: signer,
+				hostSigner: signer,
+				cert: &ssh.Certificate{
+					Serial:          1234567890,
+					ValidAfter:      uint64(now.Unix()),
+					ValidBefore:     uint64(now.Add(time.Hour).Unix()),
+					CertType:        ssh.UserCert,
+					ValidPrincipals: []string{"foo", "bar"},
+					KeyId:           "foo",
+				},
+				key:      pub,
+				signOpts: []provisioner.SignOption{},
+				err:      errors.New("authority.authorizeSSHCertificate: certificate has been revoked"),
+				code:     http.StatusUnauthorized,
+			}
+		},
+		"fail/is-revoked-error": func(t *testing.T) *test {
+			auth := testAuthority(t)
+			auth.db = &db.MockAuthDB{
+				MIsSSHRevoked: func(sn string) (bool, error) {
+					return false, errors.New("an error")
+				},
+			}
+			return &test{
+				auth:       auth,
+				userSigner: signer,
+				hostSigner: signer,
+				cert: &ssh.Certificate{
+					Serial:          1234567890,
+					ValidAfter:      uint64(now.Unix()),
+					ValidBefore:     uint64(now.Add(time.Hour).Unix()),
+					CertType:        ssh.UserCert,
+					ValidPrincipals: []string{"foo", "bar"},
+					KeyId:           "foo",
+				},
+				key:      pub,
+				signOpts: []provisioner.SignOption{},
+				err:      errors.New("authority.authorizeSSHCertificate: an error"),
+				code:     http.StatusInternalServerError,
+			}
+		},
 		"fail/opts-type": func(t *testing.T) *test {
 			return &test{
 				userSigner: signer,
@@ -894,6 +886,9 @@ func TestAuthority_RekeySSH(t *testing.T) {
 		"fail/db-store": func(t *testing.T) *test {
 			return &test{
 				auth: testAuthority(t, WithDatabase(&db.MockAuthDB{
+					MIsSSHRevoked: func(sn string) (bool, error) {
+						return false, nil
+					},
 					MStoreSSHCertificate: func(cert *ssh.Certificate) error {
 						return errors.New("force")
 					},
