@@ -2,9 +2,10 @@ package ca
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // used to create the Subject Key Identifier by RFC 5280
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -64,6 +65,8 @@ func generateSubjectKeyID(pub crypto.PublicKey) ([]byte, error) {
 	if _, err = asn1.Unmarshal(b, &info); err != nil {
 		return nil, errors.Wrap(err, "error unmarshaling public key")
 	}
+
+	//nolint:gosec // used to create the Subject Key Identifier by RFC 5280
 	hash := sha1.Sum(info.SubjectPublicKey.Bytes)
 	return hash[:], nil
 }
@@ -115,7 +118,7 @@ func TestCASign(t *testing.T) {
 				ca:     ca,
 				body:   "invalid json",
 				status: http.StatusBadRequest,
-				errMsg: errs.BadRequestDefaultMsg,
+				errMsg: errs.BadRequestPrefix,
 			}
 		},
 		"fail invalid-csr-sig": func(t *testing.T) *signTest {
@@ -153,7 +156,7 @@ ZEp7knvU2psWRw==
 				ca:     ca,
 				body:   string(body),
 				status: http.StatusBadRequest,
-				errMsg: errs.BadRequestDefaultMsg,
+				errMsg: errs.BadRequestPrefix,
 			}
 		},
 		"fail unauthorized-ott": func(t *testing.T) *signTest {
@@ -200,8 +203,8 @@ ZEp7knvU2psWRw==
 			return &signTest{
 				ca:     ca,
 				body:   string(body),
-				status: http.StatusUnauthorized,
-				errMsg: errs.UnauthorizedDefaultMsg,
+				status: http.StatusForbidden,
+				errMsg: errs.ForbiddenPrefix,
 			}
 		},
 		"ok": func(t *testing.T) *signTest {
@@ -281,10 +284,14 @@ ZEp7knvU2psWRw==
 			assert.FatalError(t, err)
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
+				resp := &http.Response{
+					Body: body,
+				}
 				if rr.Code < http.StatusBadRequest {
 					var sign api.SignResponse
 					assert.FatalError(t, readJSON(body, &sign))
@@ -294,15 +301,15 @@ ZEp7knvU2psWRw==
 					assert.Equals(t, leaf.NotBefore, now.Truncate(time.Second))
 					assert.Equals(t, leaf.NotAfter, leafExpiry.Truncate(time.Second))
 
-					assert.Equals(t, fmt.Sprintf("%v", leaf.Subject),
-						fmt.Sprintf("%v", &pkix.Name{
+					assert.Equals(t, leaf.Subject.String(),
+						pkix.Name{
 							Country:       []string{asn1dn.Country},
 							Organization:  []string{asn1dn.Organization},
 							Locality:      []string{asn1dn.Locality},
 							StreetAddress: []string{asn1dn.StreetAddress},
 							Province:      []string{asn1dn.Province},
 							CommonName:    asn1dn.CommonName,
-						}))
+						}.String())
 					assert.Equals(t, leaf.Issuer, intermediate.Subject)
 
 					assert.Equals(t, leaf.SignatureAlgorithm, x509.ECDSAWithSHA256)
@@ -321,8 +328,8 @@ ZEp7knvU2psWRw==
 					assert.FatalError(t, err)
 					assert.Equals(t, intermediate, realIntermediate)
 				} else {
-					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					err := readError(resp)
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -360,10 +367,14 @@ func TestCAProvisioners(t *testing.T) {
 			assert.FatalError(t, err)
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
+				resp := &http.Response{
+					Body: body,
+				}
 				if rr.Code < http.StatusBadRequest {
 					var resp api.ProvisionersResponse
 
@@ -374,8 +385,8 @@ func TestCAProvisioners(t *testing.T) {
 					assert.FatalError(t, err)
 					assert.Equals(t, a, b)
 				} else {
-					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					err := readError(resp)
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -426,17 +437,21 @@ func TestCAProvisionerEncryptedKey(t *testing.T) {
 			assert.FatalError(t, err)
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
+				resp := &http.Response{
+					Body: body,
+				}
 				if rr.Code < http.StatusBadRequest {
 					var ek api.ProvisionerKeyResponse
 					assert.FatalError(t, readJSON(body, &ek))
 					assert.Equals(t, ek.Key, tc.expectedKey)
 				} else {
-					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					err := readError(resp)
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -487,17 +502,21 @@ func TestCARoot(t *testing.T) {
 			assert.FatalError(t, err)
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
+				resp := &http.Response{
+					Body: body,
+				}
 				if rr.Code < http.StatusBadRequest {
 					var root api.RootResponse
 					assert.FatalError(t, readJSON(body, &root))
 					assert.Equals(t, root.RootPEM.Certificate, rootCrt)
 				} else {
-					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					err := readError(resp)
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -534,7 +553,8 @@ func TestCAHealth(t *testing.T) {
 			assert.FatalError(t, err)
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
@@ -588,7 +608,7 @@ func TestCARenew(t *testing.T) {
 				ca:           ca,
 				tlsConnState: nil,
 				status:       http.StatusBadRequest,
-				errMsg:       errs.BadRequestDefaultMsg,
+				errMsg:       errs.BadRequestPrefix,
 			}
 		},
 		"request-missing-peer-certificate": func(t *testing.T) *renewTest {
@@ -596,7 +616,7 @@ func TestCARenew(t *testing.T) {
 				ca:           ca,
 				tlsConnState: &tls.ConnectionState{PeerCertificates: []*x509.Certificate{}},
 				status:       http.StatusBadRequest,
-				errMsg:       errs.BadRequestDefaultMsg,
+				errMsg:       errs.BadRequestPrefix,
 			}
 		},
 		"success": func(t *testing.T) *renewTest {
@@ -605,7 +625,7 @@ func TestCARenew(t *testing.T) {
 			cert, err := x509util.NewCertificate(cr)
 			assert.FatalError(t, err)
 			crt := cert.GetCertificate()
-			crt.NotBefore = time.Now()
+			crt.NotBefore = now
 			crt.NotAfter = leafExpiry
 			crt, err = x509util.CreateCertificate(crt, intermediateCert, pub, intermediateKey.(crypto.Signer))
 			assert.FatalError(t, err)
@@ -628,10 +648,14 @@ func TestCARenew(t *testing.T) {
 			rq.TLS = tc.tlsConnState
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
+				resp := &http.Response{
+					Body: body,
+				}
 				if rr.Code < http.StatusBadRequest {
 					var sign api.SignResponse
 					assert.FatalError(t, readJSON(body, &sign))
@@ -641,10 +665,10 @@ func TestCARenew(t *testing.T) {
 					assert.Equals(t, leaf.NotBefore, now.Truncate(time.Second))
 					assert.Equals(t, leaf.NotAfter, leafExpiry.Truncate(time.Second))
 
-					assert.Equals(t, fmt.Sprintf("%v", leaf.Subject),
-						fmt.Sprintf("%v", &pkix.Name{
+					assert.Equals(t, leaf.Subject.String(),
+						pkix.Name{
 							CommonName: asn1dn.CommonName,
-						}))
+						}.String())
 					assert.Equals(t, leaf.Issuer, intermediate.Subject)
 
 					assert.Equals(t, leaf.SignatureAlgorithm, x509.ECDSAWithSHA256)
@@ -664,8 +688,8 @@ func TestCARenew(t *testing.T) {
 
 					assert.Equals(t, *sign.TLSOptions, authority.DefaultTLSOptions)
 				} else {
-					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					err := readError(resp)
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)

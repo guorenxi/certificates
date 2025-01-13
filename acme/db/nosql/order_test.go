@@ -12,7 +12,7 @@ import (
 	"github.com/smallstep/certificates/acme"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/nosql"
-	nosqldb "github.com/smallstep/nosql/database"
+	"github.com/smallstep/nosql/database"
 )
 
 func TestDB_getDBOrder(t *testing.T) {
@@ -31,7 +31,7 @@ func TestDB_getDBOrder(t *testing.T) {
 						assert.Equals(t, bucket, orderTable)
 						assert.Equals(t, string(key), orderID)
 
-						return nil, nosqldb.ErrNotFound
+						return nil, database.ErrNotFound
 					},
 				},
 				acmeErr: acme.NewError(acme.ErrorMalformedType, "order orderID not found"),
@@ -80,7 +80,7 @@ func TestDB_getDBOrder(t *testing.T) {
 					{Type: "dns", Value: "example.foo.com"},
 				},
 				AuthorizationIDs: []string{"foo", "bar"},
-				Error:            acme.NewError(acme.ErrorMalformedType, "force"),
+				Error:            acme.NewError(acme.ErrorMalformedType, "The request message was malformed"),
 			}
 			b, err := json.Marshal(dbo)
 			assert.FatalError(t, err)
@@ -100,36 +100,34 @@ func TestDB_getDBOrder(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
-			if dbo, err := db.getDBOrder(context.Background(), orderID); err != nil {
-				switch k := err.(type) {
-				case *acme.Error:
+			d := DB{db: tc.db}
+			if dbo, err := d.getDBOrder(context.Background(), orderID); err != nil {
+				var ae *acme.Error
+				if errors.As(err, &ae) {
 					if assert.NotNil(t, tc.acmeErr) {
-						assert.Equals(t, k.Type, tc.acmeErr.Type)
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
-						assert.Equals(t, k.Status, tc.acmeErr.Status)
-						assert.Equals(t, k.Err.Error(), tc.acmeErr.Err.Error())
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, ae.Type, tc.acmeErr.Type)
+						assert.Equals(t, ae.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, ae.Status, tc.acmeErr.Status)
+						assert.Equals(t, ae.Err.Error(), tc.acmeErr.Err.Error())
+						assert.Equals(t, ae.Detail, tc.acmeErr.Detail)
 					}
-				default:
+				} else {
 					if assert.NotNil(t, tc.err) {
 						assert.HasPrefix(t, err.Error(), tc.err.Error())
 					}
 				}
-			} else {
-				if assert.Nil(t, tc.err) {
-					assert.Equals(t, dbo.ID, tc.dbo.ID)
-					assert.Equals(t, dbo.ProvisionerID, tc.dbo.ProvisionerID)
-					assert.Equals(t, dbo.CertificateID, tc.dbo.CertificateID)
-					assert.Equals(t, dbo.Status, tc.dbo.Status)
-					assert.Equals(t, dbo.CreatedAt, tc.dbo.CreatedAt)
-					assert.Equals(t, dbo.ExpiresAt, tc.dbo.ExpiresAt)
-					assert.Equals(t, dbo.NotBefore, tc.dbo.NotBefore)
-					assert.Equals(t, dbo.NotAfter, tc.dbo.NotAfter)
-					assert.Equals(t, dbo.Identifiers, tc.dbo.Identifiers)
-					assert.Equals(t, dbo.AuthorizationIDs, tc.dbo.AuthorizationIDs)
-					assert.Equals(t, dbo.Error.Error(), tc.dbo.Error.Error())
-				}
+			} else if assert.Nil(t, tc.err) {
+				assert.Equals(t, dbo.ID, tc.dbo.ID)
+				assert.Equals(t, dbo.ProvisionerID, tc.dbo.ProvisionerID)
+				assert.Equals(t, dbo.CertificateID, tc.dbo.CertificateID)
+				assert.Equals(t, dbo.Status, tc.dbo.Status)
+				assert.Equals(t, dbo.CreatedAt, tc.dbo.CreatedAt)
+				assert.Equals(t, dbo.ExpiresAt, tc.dbo.ExpiresAt)
+				assert.Equals(t, dbo.NotBefore, tc.dbo.NotBefore)
+				assert.Equals(t, dbo.NotAfter, tc.dbo.NotAfter)
+				assert.Equals(t, dbo.Identifiers, tc.dbo.Identifiers)
+				assert.Equals(t, dbo.AuthorizationIDs, tc.dbo.AuthorizationIDs)
+				assert.Equals(t, dbo.Error.Error(), tc.dbo.Error.Error())
 			}
 		})
 	}
@@ -164,7 +162,7 @@ func TestDB_GetOrder(t *testing.T) {
 						assert.Equals(t, bucket, orderTable)
 						assert.Equals(t, string(key), orderID)
 
-						return nil, nosqldb.ErrNotFound
+						return nil, database.ErrNotFound
 					},
 				},
 				acmeErr: acme.NewError(acme.ErrorMalformedType, "order orderID not found"),
@@ -187,7 +185,7 @@ func TestDB_GetOrder(t *testing.T) {
 					{Type: "dns", Value: "example.foo.com"},
 				},
 				AuthorizationIDs: []string{"foo", "bar"},
-				Error:            acme.NewError(acme.ErrorMalformedType, "force"),
+				Error:            acme.NewError(acme.ErrorMalformedType, "The request message was malformed"),
 			}
 			b, err := json.Marshal(dbo)
 			assert.FatalError(t, err)
@@ -206,36 +204,34 @@ func TestDB_GetOrder(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
-			if o, err := db.GetOrder(context.Background(), orderID); err != nil {
-				switch k := err.(type) {
-				case *acme.Error:
+			d := DB{db: tc.db}
+			if o, err := d.GetOrder(context.Background(), orderID); err != nil {
+				var ae *acme.Error
+				if errors.As(err, &ae) {
 					if assert.NotNil(t, tc.acmeErr) {
-						assert.Equals(t, k.Type, tc.acmeErr.Type)
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
-						assert.Equals(t, k.Status, tc.acmeErr.Status)
-						assert.Equals(t, k.Err.Error(), tc.acmeErr.Err.Error())
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, ae.Type, tc.acmeErr.Type)
+						assert.Equals(t, ae.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, ae.Status, tc.acmeErr.Status)
+						assert.Equals(t, ae.Err.Error(), tc.acmeErr.Err.Error())
+						assert.Equals(t, ae.Detail, tc.acmeErr.Detail)
 					}
-				default:
+				} else {
 					if assert.NotNil(t, tc.err) {
 						assert.HasPrefix(t, err.Error(), tc.err.Error())
 					}
 				}
-			} else {
-				if assert.Nil(t, tc.err) {
-					assert.Equals(t, o.ID, tc.dbo.ID)
-					assert.Equals(t, o.AccountID, tc.dbo.AccountID)
-					assert.Equals(t, o.ProvisionerID, tc.dbo.ProvisionerID)
-					assert.Equals(t, o.CertificateID, tc.dbo.CertificateID)
-					assert.Equals(t, o.Status, tc.dbo.Status)
-					assert.Equals(t, o.ExpiresAt, tc.dbo.ExpiresAt)
-					assert.Equals(t, o.NotBefore, tc.dbo.NotBefore)
-					assert.Equals(t, o.NotAfter, tc.dbo.NotAfter)
-					assert.Equals(t, o.Identifiers, tc.dbo.Identifiers)
-					assert.Equals(t, o.AuthorizationIDs, tc.dbo.AuthorizationIDs)
-					assert.Equals(t, o.Error.Error(), tc.dbo.Error.Error())
-				}
+			} else if assert.Nil(t, tc.err) {
+				assert.Equals(t, o.ID, tc.dbo.ID)
+				assert.Equals(t, o.AccountID, tc.dbo.AccountID)
+				assert.Equals(t, o.ProvisionerID, tc.dbo.ProvisionerID)
+				assert.Equals(t, o.CertificateID, tc.dbo.CertificateID)
+				assert.Equals(t, o.Status, tc.dbo.Status)
+				assert.Equals(t, o.ExpiresAt, tc.dbo.ExpiresAt)
+				assert.Equals(t, o.NotBefore, tc.dbo.NotBefore)
+				assert.Equals(t, o.NotAfter, tc.dbo.NotAfter)
+				assert.Equals(t, o.Identifiers, tc.dbo.Identifiers)
+				assert.Equals(t, o.AuthorizationIDs, tc.dbo.AuthorizationIDs)
+				assert.Equals(t, o.Error.Error(), tc.dbo.Error.Error())
 			}
 		})
 	}
@@ -288,7 +284,7 @@ func TestDB_UpdateOrder(t *testing.T) {
 				ID:            orderID,
 				Status:        acme.StatusValid,
 				CertificateID: "certID",
-				Error:         acme.NewError(acme.ErrorMalformedType, "force"),
+				Error:         acme.NewError(acme.ErrorMalformedType, "The request message was malformed"),
 			}
 			return test{
 				o: o,
@@ -328,7 +324,7 @@ func TestDB_UpdateOrder(t *testing.T) {
 				ID:            orderID,
 				Status:        acme.StatusValid,
 				CertificateID: "certID",
-				Error:         acme.NewError(acme.ErrorMalformedType, "force"),
+				Error:         acme.NewError(acme.ErrorMalformedType, "The request message was malformed"),
 			}
 			return test{
 				o: o,
@@ -366,8 +362,8 @@ func TestDB_UpdateOrder(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
-			if err := db.UpdateOrder(context.Background(), tc.o); err != nil {
+			d := DB{db: tc.db}
+			if err := d.UpdateOrder(context.Background(), tc.o); err != nil {
 				if assert.NotNil(t, tc.err) {
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -376,7 +372,7 @@ func TestDB_UpdateOrder(t *testing.T) {
 					assert.Equals(t, tc.o.ID, dbo.ID)
 					assert.Equals(t, tc.o.CertificateID, "certID")
 					assert.Equals(t, tc.o.Status, acme.StatusValid)
-					assert.Equals(t, tc.o.Error.Error(), acme.NewError(acme.ErrorMalformedType, "force").Error())
+					assert.Equals(t, tc.o.Error.Error(), acme.NewError(acme.ErrorMalformedType, "The request message was malformed").Error())
 				}
 			}
 		})
@@ -511,7 +507,7 @@ func TestDB_CreateOrder(t *testing.T) {
 					MGet: func(bucket, key []byte) ([]byte, error) {
 						assert.Equals(t, string(bucket), string(ordersByAccountIDTable))
 						assert.Equals(t, string(key), o.AccountID)
-						return nil, nosqldb.ErrNotFound
+						return nil, database.ErrNotFound
 					},
 					MCmpAndSwap: func(bucket, key, old, nu []byte) ([]byte, bool, error) {
 						switch string(bucket) {
@@ -557,8 +553,8 @@ func TestDB_CreateOrder(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
-			if err := db.CreateOrder(context.Background(), tc.o); err != nil {
+			d := DB{db: tc.db}
+			if err := d.CreateOrder(context.Background(), tc.o); err != nil {
 				if assert.NotNil(t, tc.err) {
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -663,7 +659,7 @@ func TestDB_updateAddOrderIDs(t *testing.T) {
 						assert.Equals(t, newdbo.ID, "foo")
 						assert.Equals(t, newdbo.Status, acme.StatusInvalid)
 						assert.Equals(t, newdbo.ExpiresAt, expiry)
-						assert.Equals(t, newdbo.Error.Error(), acme.NewError(acme.ErrorMalformedType, "order has expired").Error())
+						assert.Equals(t, newdbo.Error.Error(), acme.NewError(acme.ErrorMalformedType, "The request message was malformed").Error())
 						return nil, false, errors.New("force")
 					},
 				},
@@ -680,7 +676,7 @@ func TestDB_updateAddOrderIDs(t *testing.T) {
 					MGet: func(bucket, key []byte) ([]byte, error) {
 						assert.Equals(t, bucket, ordersByAccountIDTable)
 						assert.Equals(t, key, []byte(accID))
-						return nil, nosqldb.ErrNotFound
+						return nil, database.ErrNotFound
 					},
 					MCmpAndSwap: func(bucket, key, old, nu []byte) ([]byte, bool, error) {
 						assert.Equals(t, bucket, ordersByAccountIDTable)
@@ -708,6 +704,34 @@ func TestDB_updateAddOrderIDs(t *testing.T) {
 				},
 				addOids: addOids,
 				err:     errors.Errorf("error saving orderIDs index for account %s", accID),
+			}
+		},
+		"ok/no-old": func(t *testing.T) test {
+			return test{
+				db: &db.MockNoSQLDB{
+					MGet: func(bucket, key []byte) ([]byte, error) {
+						switch string(bucket) {
+						case string(ordersByAccountIDTable):
+							return nil, database.ErrNotFound
+						default:
+							assert.FatalError(t, errors.Errorf("unexpected bucket %s", string(bucket)))
+							return nil, errors.New("force")
+						}
+					},
+					MCmpAndSwap: func(bucket, key, old, nu []byte) ([]byte, bool, error) {
+						switch string(bucket) {
+						case string(ordersByAccountIDTable):
+							assert.Equals(t, key, []byte(accID))
+							assert.Equals(t, old, nil)
+							assert.Equals(t, nu, nil)
+							return nil, true, nil
+						default:
+							assert.FatalError(t, errors.Errorf("unexpected bucket %s", string(bucket)))
+							return nil, false, errors.New("force")
+						}
+					},
+				},
+				res: []string{},
 			}
 		},
 		"ok/all-old-not-pending": func(t *testing.T) test {
@@ -967,36 +991,34 @@ func TestDB_updateAddOrderIDs(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
+			d := DB{db: tc.db}
 			var (
 				res []string
 				err error
 			)
 			if tc.addOids == nil {
-				res, err = db.updateAddOrderIDs(context.Background(), accID)
+				res, err = d.updateAddOrderIDs(context.Background(), accID, false)
 			} else {
-				res, err = db.updateAddOrderIDs(context.Background(), accID, tc.addOids...)
+				res, err = d.updateAddOrderIDs(context.Background(), accID, false, tc.addOids...)
 			}
 
 			if err != nil {
-				switch k := err.(type) {
-				case *acme.Error:
+				var ae *acme.Error
+				if errors.As(err, &ae) {
 					if assert.NotNil(t, tc.acmeErr) {
-						assert.Equals(t, k.Type, tc.acmeErr.Type)
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
-						assert.Equals(t, k.Status, tc.acmeErr.Status)
-						assert.Equals(t, k.Err.Error(), tc.acmeErr.Err.Error())
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, ae.Type, tc.acmeErr.Type)
+						assert.Equals(t, ae.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, ae.Status, tc.acmeErr.Status)
+						assert.Equals(t, ae.Err.Error(), tc.acmeErr.Err.Error())
+						assert.Equals(t, ae.Detail, tc.acmeErr.Detail)
 					}
-				default:
+				} else {
 					if assert.NotNil(t, tc.err) {
 						assert.HasPrefix(t, err.Error(), tc.err.Error())
 					}
 				}
-			} else {
-				if assert.Nil(t, tc.err) {
-					assert.True(t, reflect.DeepEqual(res, tc.res))
-				}
+			} else if assert.Nil(t, tc.err) {
+				assert.True(t, reflect.DeepEqual(res, tc.res))
 			}
 		})
 	}

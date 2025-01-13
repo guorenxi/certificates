@@ -5,19 +5,22 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/binary"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
+	"golang.org/x/crypto/ssh"
+
+	"go.step.sm/crypto/randutil"
+	"go.step.sm/crypto/sshutil"
+
+	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/templates"
-	"go.step.sm/crypto/jose"
-	"go.step.sm/crypto/randutil"
-	"go.step.sm/crypto/sshutil"
-	"golang.org/x/crypto/ssh"
+	"github.com/smallstep/certificates/webhook"
 )
 
 const (
@@ -32,110 +35,24 @@ const (
 	SSHAddUserCommand = "sudo useradd -m <principal>; nc -q0 localhost 22"
 )
 
-// SSHConfig contains the user and host keys.
-type SSHConfig struct {
-	HostKey          string          `json:"hostKey"`
-	UserKey          string          `json:"userKey"`
-	Keys             []*SSHPublicKey `json:"keys,omitempty"`
-	AddUserPrincipal string          `json:"addUserPrincipal,omitempty"`
-	AddUserCommand   string          `json:"addUserCommand,omitempty"`
-	Bastion          *Bastion        `json:"bastion,omitempty"`
-}
-
-// Bastion contains the custom properties used on bastion.
-type Bastion struct {
-	Hostname string `json:"hostname"`
-	User     string `json:"user,omitempty"`
-	Port     string `json:"port,omitempty"`
-	Command  string `json:"cmd,omitempty"`
-	Flags    string `json:"flags,omitempty"`
-}
-
-// HostTag are tagged with k,v pairs. These tags are how a user is ultimately
-// associated with a host.
-type HostTag struct {
-	ID    string
-	Name  string
-	Value string
-}
-
-// Host defines expected attributes for an ssh host.
-type Host struct {
-	HostID   string    `json:"hid"`
-	HostTags []HostTag `json:"host_tags"`
-	Hostname string    `json:"hostname"`
-}
-
-// Validate checks the fields in SSHConfig.
-func (c *SSHConfig) Validate() error {
-	if c == nil {
-		return nil
-	}
-	for _, k := range c.Keys {
-		if err := k.Validate(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// SSHPublicKey contains a public key used by federated CAs to keep old signing
-// keys for this ca.
-type SSHPublicKey struct {
-	Type      string          `json:"type"`
-	Federated bool            `json:"federated"`
-	Key       jose.JSONWebKey `json:"key"`
-	publicKey ssh.PublicKey
-}
-
-// Validate checks the fields in SSHPublicKey.
-func (k *SSHPublicKey) Validate() error {
-	switch {
-	case k.Type == "":
-		return errors.New("type cannot be empty")
-	case k.Type != provisioner.SSHHostCert && k.Type != provisioner.SSHUserCert:
-		return errors.Errorf("invalid type %s, it must be user or host", k.Type)
-	case !k.Key.IsPublic():
-		return errors.New("invalid key type, it must be a public key")
-	}
-
-	key, err := ssh.NewPublicKey(k.Key.Key)
-	if err != nil {
-		return errors.Wrap(err, "error creating ssh key")
-	}
-	k.publicKey = key
-	return nil
-}
-
-// PublicKey returns the ssh public key.
-func (k *SSHPublicKey) PublicKey() ssh.PublicKey {
-	return k.publicKey
-}
-
-// SSHKeys represents the SSH User and Host public keys.
-type SSHKeys struct {
-	UserKeys []ssh.PublicKey
-	HostKeys []ssh.PublicKey
-}
-
 // GetSSHRoots returns the SSH User and Host public keys.
-func (a *Authority) GetSSHRoots(context.Context) (*SSHKeys, error) {
-	return &SSHKeys{
+func (a *Authority) GetSSHRoots(context.Context) (*config.SSHKeys, error) {
+	return &config.SSHKeys{
 		HostKeys: a.sshCAHostCerts,
 		UserKeys: a.sshCAUserCerts,
 	}, nil
 }
 
 // GetSSHFederation returns the public keys for federated SSH signers.
-func (a *Authority) GetSSHFederation(context.Context) (*SSHKeys, error) {
-	return &SSHKeys{
+func (a *Authority) GetSSHFederation(context.Context) (*config.SSHKeys, error) {
+	return &config.SSHKeys{
 		HostKeys: a.sshCAHostFederatedCerts,
 		UserKeys: a.sshCAUserFederatedCerts,
 	}, nil
 }
 
 // GetSSHConfig returns rendered templates for clients (user) or servers (host).
-func (a *Authority) GetSSHConfig(ctx context.Context, typ string, data map[string]string) ([]templates.Output, error) {
+func (a *Authority) GetSSHConfig(_ context.Context, typ string, data map[string]string) ([]templates.Output, error) {
 	if a.sshCAUserCertSignKey == nil && a.sshCAHostCertSignKey == nil {
 		return nil, errs.NotFound("getSSHConfig: ssh is not configured")
 	}
@@ -155,7 +72,7 @@ func (a *Authority) GetSSHConfig(ctx context.Context, typ string, data map[strin
 			ts = a.templates.SSH.Host
 		}
 	default:
-		return nil, errs.BadRequest("getSSHConfig: type %s is not valid", typ)
+		return nil, errs.BadRequest("invalid certificate type '%s'", typ)
 	}
 
 	// Merge user and default data
@@ -180,13 +97,22 @@ func (a *Authority) GetSSHConfig(ctx context.Context, typ string, data map[strin
 
 		// Check for required variables.
 		if err := t.ValidateRequiredData(data); err != nil {
-			return nil, errs.BadRequestErr(err, errs.WithMessage("%v, please use `--set <key=value>` flag", err))
+			return nil, errs.BadRequestErr(err, "%v, please use `--set <key=value>` flag", err)
 		}
 
 		o, err := t.Output(mergedData)
 		if err != nil {
 			return nil, err
 		}
+
+		// Backwards compatibility for version of the cli older than v0.18.0.
+		// Before v0.18.0 we were not passing any value for SSHTemplateVersionKey
+		// from the cli.
+		if o.Name == "step_includes.tpl" && data[templates.SSHTemplateVersionKey] == "" {
+			o.Type = templates.File
+			o.Path = strings.TrimPrefix(o.Path, "${STEPPATH}/")
+		}
+
 		output = append(output, o)
 	}
 	return output, nil
@@ -194,7 +120,7 @@ func (a *Authority) GetSSHConfig(ctx context.Context, typ string, data map[strin
 
 // GetSSHBastion returns the bastion configuration, for the given pair user,
 // hostname.
-func (a *Authority) GetSSHBastion(ctx context.Context, user string, hostname string) (*Bastion, error) {
+func (a *Authority) GetSSHBastion(ctx context.Context, user, hostname string) (*config.Bastion, error) {
 	if a.sshBastionFunc != nil {
 		bs, err := a.sshBastionFunc(ctx, user, hostname)
 		return bs, errs.Wrap(http.StatusInternalServerError, err, "authority.GetSSHBastion")
@@ -213,6 +139,7 @@ func (a *Authority) GetSSHBastion(ctx context.Context, user string, hostname str
 				return a.config.SSH.Bastion, nil
 			}
 		}
+		//nolint:nilnil // legacy
 		return nil, nil
 	}
 	return nil, errs.NotFound("authority.GetSSHBastion; ssh is not configured")
@@ -220,22 +147,38 @@ func (a *Authority) GetSSHBastion(ctx context.Context, user string, hostname str
 
 // SignSSH creates a signed SSH certificate with the given public key and options.
 func (a *Authority) SignSSH(ctx context.Context, key ssh.PublicKey, opts provisioner.SignSSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
+	cert, prov, err := a.signSSH(ctx, key, opts, signOpts...)
+	a.meter.SSHSigned(prov, err)
+	return cert, err
+}
+
+func (a *Authority) signSSH(ctx context.Context, key ssh.PublicKey, opts provisioner.SignSSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, provisioner.Interface, error) {
 	var (
-		certOptions []sshutil.Option
-		mods        []provisioner.SSHCertModifier
-		validators  []provisioner.SSHCertValidator
+		certOptions   []sshutil.Option
+		mods          []provisioner.SSHCertModifier
+		validators    []provisioner.SSHCertValidator
+		keyValidators []provisioner.SSHPublicKeyValidator
 	)
 
-	// Validate given options.
+	// Validate given key and options
+	if key == nil {
+		return nil, nil, errs.BadRequest("ssh public key cannot be nil")
+	}
 	if err := opts.Validate(); err != nil {
-		return nil, errs.Wrap(http.StatusBadRequest, err, "authority.SignSSH")
+		return nil, nil, err
 	}
 
 	// Set backdate with the configured value
 	opts.Backdate = a.config.AuthorityConfig.Backdate.Duration
 
+	var prov provisioner.Interface
+	var webhookCtl webhookController
 	for _, op := range signOpts {
 		switch o := op.(type) {
+		// Capture current provisioner
+		case provisioner.Interface:
+			prov = o
+
 		// add options to NewCertificate
 		case provisioner.SSHCertificateOptions:
 			certOptions = append(certOptions, o.Options(opts)...)
@@ -244,6 +187,10 @@ func (a *Authority) SignSSH(ctx context.Context, key ssh.PublicKey, opts provisi
 		case provisioner.SSHCertModifier:
 			mods = append(mods, o)
 
+		// validate the ssh public key
+		case provisioner.SSHPublicKeyValidator:
+			keyValidators = append(keyValidators, o)
+
 		// validate the ssh.Certificate
 		case provisioner.SSHCertValidator:
 			validators = append(validators, o)
@@ -251,11 +198,25 @@ func (a *Authority) SignSSH(ctx context.Context, key ssh.PublicKey, opts provisi
 		// validate the given SSHOptions
 		case provisioner.SSHCertOptionsValidator:
 			if err := o.Valid(opts); err != nil {
-				return nil, errs.Wrap(http.StatusForbidden, err, "authority.SignSSH")
+				return nil, prov, errs.BadRequestErr(err, "error validating ssh certificate options")
 			}
 
+		// call webhooks
+		case webhookController:
+			webhookCtl = o
+
 		default:
-			return nil, errs.InternalServer("authority.SignSSH: invalid extra option type %T", o)
+			return nil, prov, errs.InternalServer("authority.SignSSH: invalid extra option type %T", o)
+		}
+	}
+
+	// Validate public key
+	for _, v := range keyValidators {
+		if err := v.Valid(key); err != nil {
+			return nil, nil, errs.ApplyOptions(
+				errs.ForbiddenErr(err, err.Error()), //nolint:govet // allow non-constant error messages
+				errs.WithKeyVal("signOptions", signOpts),
+			)
 		}
 	}
 
@@ -267,16 +228,33 @@ func (a *Authority) SignSSH(ctx context.Context, key ssh.PublicKey, opts provisi
 		Key:        key,
 	}
 
+	// Call enriching webhooks
+	if err := a.callEnrichingWebhooksSSH(ctx, prov, webhookCtl, cr); err != nil {
+		return nil, prov, errs.ApplyOptions(
+			errs.ForbiddenErr(err, err.Error()), //nolint:govet // allow non-constant error messages
+			errs.WithKeyVal("signOptions", signOpts),
+		)
+	}
+
 	// Create certificate from template.
 	certificate, err := sshutil.NewCertificate(cr, certOptions...)
 	if err != nil {
-		if _, ok := err.(*sshutil.TemplateError); ok {
-			return nil, errs.NewErr(http.StatusBadRequest, err,
-				errs.WithMessage(err.Error()),
+		var te *sshutil.TemplateError
+		switch {
+		case errors.As(err, &te):
+			return nil, prov, errs.ApplyOptions(
+				errs.BadRequestErr(err, err.Error()), //nolint:govet // allow non-constant error messages
 				errs.WithKeyVal("signOptions", signOpts),
 			)
+		case strings.HasPrefix(err.Error(), "error unmarshaling certificate"):
+			// explicitly check for unmarshaling errors, which are most probably caused by JSON template syntax errors
+			return nil, prov, errs.InternalServerErr(templatingError(err),
+				errs.WithKeyVal("signOptions", signOpts),
+				errs.WithMessage("error applying certificate template"),
+			)
+		default:
+			return nil, prov, errs.Wrap(http.StatusInternalServerError, err, "authority.SignSSH")
 		}
-		return nil, errs.Wrap(http.StatusInternalServerError, err, "authority.SignSSH")
 	}
 
 	// Get actual *ssh.Certificate and continue with provisioner modifiers.
@@ -285,13 +263,13 @@ func (a *Authority) SignSSH(ctx context.Context, key ssh.PublicKey, opts provisi
 	// Use SignSSHOptions to modify the certificate validity. It will be later
 	// checked or set if not defined.
 	if err := opts.ModifyValidity(certTpl); err != nil {
-		return nil, errs.Wrap(http.StatusBadRequest, err, "authority.SignSSH")
+		return nil, prov, errs.BadRequestErr(err, err.Error()) //nolint:govet // allow non-constant error messages
 	}
 
 	// Use provisioner modifiers.
 	for _, m := range mods {
 		if err := m.Modify(certTpl, opts); err != nil {
-			return nil, errs.Wrap(http.StatusForbidden, err, "authority.SignSSH")
+			return nil, prov, errs.ForbiddenErr(err, "error creating ssh certificate")
 		}
 	}
 
@@ -300,42 +278,81 @@ func (a *Authority) SignSSH(ctx context.Context, key ssh.PublicKey, opts provisi
 	switch certTpl.CertType {
 	case ssh.UserCert:
 		if a.sshCAUserCertSignKey == nil {
-			return nil, errs.NotImplemented("authority.SignSSH: user certificate signing is not enabled")
+			return nil, prov, errs.NotImplemented("authority.SignSSH: user certificate signing is not enabled")
 		}
 		signer = a.sshCAUserCertSignKey
 	case ssh.HostCert:
 		if a.sshCAHostCertSignKey == nil {
-			return nil, errs.NotImplemented("authority.SignSSH: host certificate signing is not enabled")
+			return nil, prov, errs.NotImplemented("authority.SignSSH: host certificate signing is not enabled")
 		}
 		signer = a.sshCAHostCertSignKey
 	default:
-		return nil, errs.InternalServer("authority.SignSSH: unexpected ssh certificate type: %d", certTpl.CertType)
+		return nil, prov, errs.InternalServer("authority.SignSSH: unexpected ssh certificate type: %d", certTpl.CertType)
+	}
+
+	// Check if authority is allowed to sign the certificate
+	if err := a.isAllowedToSignSSHCertificate(certTpl); err != nil {
+		var ee *errs.Error
+		if errors.As(err, &ee) {
+			return nil, prov, ee
+		}
+		return nil, prov, errs.InternalServerErr(err,
+			errs.WithMessage("authority.SignSSH: error creating ssh certificate"),
+		)
+	}
+
+	// Send certificate to webhooks for authorization
+	if err := a.callAuthorizingWebhooksSSH(ctx, prov, webhookCtl, certificate, certTpl); err != nil {
+		return nil, prov, errs.ApplyOptions(
+			errs.ForbiddenErr(err, "authority.SignSSH: error signing certificate"),
+		)
 	}
 
 	// Sign certificate.
 	cert, err := sshutil.CreateCertificate(certTpl, signer)
 	if err != nil {
-		return nil, errs.Wrap(http.StatusInternalServerError, err, "authority.SignSSH: error signing certificate")
+		return nil, prov, errs.Wrap(http.StatusInternalServerError, err, "authority.SignSSH: error signing certificate")
 	}
 
 	// User provisioners validators.
 	for _, v := range validators {
 		if err := v.Valid(cert, opts); err != nil {
-			return nil, errs.Wrap(http.StatusForbidden, err, "authority.SignSSH")
+			return nil, prov, errs.ForbiddenErr(err, "error validating ssh certificate")
 		}
 	}
 
-	if err = a.db.StoreSSHCertificate(cert); err != nil && err != db.ErrNotImplemented {
-		return nil, errs.Wrap(http.StatusInternalServerError, err, "authority.SignSSH: error storing certificate in db")
+	if err := a.storeSSHCertificate(prov, cert); err != nil && !errors.Is(err, db.ErrNotImplemented) {
+		return nil, prov, errs.Wrap(http.StatusInternalServerError, err, "authority.SignSSH: error storing certificate in db")
 	}
 
-	return cert, nil
+	return cert, prov, nil
+}
+
+// isAllowedToSignSSHCertificate checks if the Authority is allowed to sign the SSH certificate.
+func (a *Authority) isAllowedToSignSSHCertificate(cert *ssh.Certificate) error {
+	return a.policyEngine.IsSSHCertificateAllowed(cert)
 }
 
 // RenewSSH creates a signed SSH certificate using the old SSH certificate as a template.
 func (a *Authority) RenewSSH(ctx context.Context, oldCert *ssh.Certificate) (*ssh.Certificate, error) {
+	cert, prov, err := a.renewSSH(ctx, oldCert)
+	a.meter.SSHRenewed(prov, err)
+	return cert, err
+}
+
+func (a *Authority) renewSSH(ctx context.Context, oldCert *ssh.Certificate) (*ssh.Certificate, provisioner.Interface, error) {
 	if oldCert.ValidAfter == 0 || oldCert.ValidBefore == 0 {
-		return nil, errs.BadRequest("rewnewSSH: cannot renew certificate without validity period")
+		return nil, nil, errs.BadRequest("cannot renew a certificate without validity period")
+	}
+
+	if err := a.authorizeSSHCertificate(ctx, oldCert); err != nil {
+		return nil, nil, err
+	}
+
+	// Attempt to extract the provisioner from the token.
+	var prov provisioner.Interface
+	if token, ok := provisioner.TokenFromContext(ctx); ok {
+		prov, _, _ = a.getProvisionerFromToken(token)
 	}
 
 	backdate := a.config.AuthorityConfig.Backdate.Duration
@@ -362,47 +379,60 @@ func (a *Authority) RenewSSH(ctx context.Context, oldCert *ssh.Certificate) (*ss
 	switch certTpl.CertType {
 	case ssh.UserCert:
 		if a.sshCAUserCertSignKey == nil {
-			return nil, errs.NotImplemented("renewSSH: user certificate signing is not enabled")
+			return nil, prov, errs.NotImplemented("renewSSH: user certificate signing is not enabled")
 		}
 		signer = a.sshCAUserCertSignKey
 	case ssh.HostCert:
 		if a.sshCAHostCertSignKey == nil {
-			return nil, errs.NotImplemented("renewSSH: host certificate signing is not enabled")
+			return nil, prov, errs.NotImplemented("renewSSH: host certificate signing is not enabled")
 		}
 		signer = a.sshCAHostCertSignKey
 	default:
-		return nil, errs.InternalServer("renewSSH: unexpected ssh certificate type: %d", certTpl.CertType)
+		return nil, prov, errs.InternalServer("renewSSH: unexpected ssh certificate type: %d", certTpl.CertType)
 	}
 
 	// Sign certificate.
 	cert, err := sshutil.CreateCertificate(certTpl, signer)
 	if err != nil {
-		return nil, errs.Wrap(http.StatusInternalServerError, err, "signSSH: error signing certificate")
+		return nil, prov, errs.Wrap(http.StatusInternalServerError, err, "signSSH: error signing certificate")
 	}
 
-	if err = a.db.StoreSSHCertificate(cert); err != nil && err != db.ErrNotImplemented {
-		return nil, errs.Wrap(http.StatusInternalServerError, err, "renewSSH: error storing certificate in db")
+	if err := a.storeRenewedSSHCertificate(prov, oldCert, cert); err != nil && !errors.Is(err, db.ErrNotImplemented) {
+		return nil, prov, errs.Wrap(http.StatusInternalServerError, err, "renewSSH: error storing certificate in db")
 	}
 
-	return cert, nil
+	return cert, prov, nil
 }
 
 // RekeySSH creates a signed SSH certificate using the old SSH certificate as a template.
 func (a *Authority) RekeySSH(ctx context.Context, oldCert *ssh.Certificate, pub ssh.PublicKey, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
-	var validators []provisioner.SSHCertValidator
+	cert, prov, err := a.rekeySSH(ctx, oldCert, pub, signOpts...)
+	a.meter.SSHRekeyed(prov, err)
+	return cert, err
+}
 
+func (a *Authority) rekeySSH(ctx context.Context, oldCert *ssh.Certificate, pub ssh.PublicKey, signOpts ...provisioner.SignOption) (*ssh.Certificate, provisioner.Interface, error) {
+	var prov provisioner.Interface
+	var validators []provisioner.SSHCertValidator
 	for _, op := range signOpts {
 		switch o := op.(type) {
+		// Capture current provisioner
+		case provisioner.Interface:
+			prov = o
 		// validate the ssh.Certificate
 		case provisioner.SSHCertValidator:
 			validators = append(validators, o)
 		default:
-			return nil, errs.InternalServer("rekeySSH; invalid extra option type %T", o)
+			return nil, prov, errs.InternalServer("rekeySSH; invalid extra option type %T", o)
 		}
 	}
 
 	if oldCert.ValidAfter == 0 || oldCert.ValidBefore == 0 {
-		return nil, errs.BadRequest("rekeySSH; cannot rekey certificate without validity period")
+		return nil, prov, errs.BadRequest("cannot rekey a certificate without validity period")
+	}
+
+	if err := a.authorizeSSHCertificate(ctx, oldCert); err != nil {
+		return nil, prov, err
 	}
 
 	backdate := a.config.AuthorityConfig.Backdate.Duration
@@ -429,49 +459,97 @@ func (a *Authority) RekeySSH(ctx context.Context, oldCert *ssh.Certificate, pub 
 	switch cert.CertType {
 	case ssh.UserCert:
 		if a.sshCAUserCertSignKey == nil {
-			return nil, errs.NotImplemented("rekeySSH; user certificate signing is not enabled")
+			return nil, prov, errs.NotImplemented("rekeySSH; user certificate signing is not enabled")
 		}
 		signer = a.sshCAUserCertSignKey
 	case ssh.HostCert:
 		if a.sshCAHostCertSignKey == nil {
-			return nil, errs.NotImplemented("rekeySSH; host certificate signing is not enabled")
+			return nil, prov, errs.NotImplemented("rekeySSH; host certificate signing is not enabled")
 		}
 		signer = a.sshCAHostCertSignKey
 	default:
-		return nil, errs.BadRequest("rekeySSH; unexpected ssh certificate type: %d", cert.CertType)
+		return nil, prov, errs.BadRequest("unexpected certificate type '%d'", cert.CertType)
 	}
 
 	var err error
 	// Sign certificate.
 	cert, err = sshutil.CreateCertificate(cert, signer)
 	if err != nil {
-		return nil, errs.Wrap(http.StatusInternalServerError, err, "signSSH: error signing certificate")
+		return nil, prov, errs.Wrap(http.StatusInternalServerError, err, "signSSH: error signing certificate")
 	}
 
 	// Apply validators from provisioner.
 	for _, v := range validators {
 		if err := v.Valid(cert, provisioner.SignSSHOptions{Backdate: backdate}); err != nil {
-			return nil, errs.Wrap(http.StatusForbidden, err, "rekeySSH")
+			return nil, prov, errs.ForbiddenErr(err, "error validating ssh certificate")
 		}
 	}
 
-	if err = a.db.StoreSSHCertificate(cert); err != nil && err != db.ErrNotImplemented {
-		return nil, errs.Wrap(http.StatusInternalServerError, err, "rekeySSH; error storing certificate in db")
+	if err := a.storeRenewedSSHCertificate(prov, oldCert, cert); err != nil && !errors.Is(err, db.ErrNotImplemented) {
+		return nil, prov, errs.Wrap(http.StatusInternalServerError, err, "rekeySSH; error storing certificate in db")
 	}
 
-	return cert, nil
+	return cert, prov, nil
+}
+
+func (a *Authority) storeSSHCertificate(prov provisioner.Interface, cert *ssh.Certificate) error {
+	type sshCertificateStorer interface {
+		StoreSSHCertificate(provisioner.Interface, *ssh.Certificate) error
+	}
+
+	// Store certificate in admindb or linkedca
+	switch s := a.adminDB.(type) {
+	case sshCertificateStorer:
+		return s.StoreSSHCertificate(prov, cert)
+	case db.CertificateStorer:
+		return s.StoreSSHCertificate(cert)
+	}
+
+	// Store certificate in localdb
+	switch s := a.db.(type) {
+	case sshCertificateStorer:
+		return s.StoreSSHCertificate(prov, cert)
+	case db.CertificateStorer:
+		return s.StoreSSHCertificate(cert)
+	default:
+		return nil
+	}
+}
+
+func (a *Authority) storeRenewedSSHCertificate(prov provisioner.Interface, parent, cert *ssh.Certificate) error {
+	type sshRenewerCertificateStorer interface {
+		StoreRenewedSSHCertificate(p provisioner.Interface, parent, cert *ssh.Certificate) error
+	}
+
+	// Store certificate in admindb or linkedca
+	switch s := a.adminDB.(type) {
+	case sshRenewerCertificateStorer:
+		return s.StoreRenewedSSHCertificate(prov, parent, cert)
+	case db.CertificateStorer:
+		return s.StoreSSHCertificate(cert)
+	}
+
+	// Store certificate in localdb
+	switch s := a.db.(type) {
+	case sshRenewerCertificateStorer:
+		return s.StoreRenewedSSHCertificate(prov, parent, cert)
+	case db.CertificateStorer:
+		return s.StoreSSHCertificate(cert)
+	default:
+		return nil
+	}
 }
 
 // IsValidForAddUser checks if a user provisioner certificate can be issued to
 // the given certificate.
 func IsValidForAddUser(cert *ssh.Certificate) error {
 	if cert.CertType != ssh.UserCert {
-		return errors.New("certificate is not a user certificate")
+		return errs.Forbidden("certificate is not a user certificate")
 	}
 
 	switch len(cert.ValidPrincipals) {
 	case 0:
-		return errors.New("certificate does not have any principals")
+		return errs.Forbidden("certificate does not have any principals")
 	case 1:
 		return nil
 	case 2:
@@ -480,9 +558,9 @@ func IsValidForAddUser(cert *ssh.Certificate) error {
 		if strings.Index(cert.ValidPrincipals[1], "@") > 0 {
 			return nil
 		}
-		return errors.New("certificate does not have only one principal")
+		return errs.Forbidden("certificate does not have only one principal")
 	default:
-		return errors.New("certificate does not have only one principal")
+		return errs.Forbidden("certificate does not have only one principal")
 	}
 }
 
@@ -492,7 +570,7 @@ func (a *Authority) SignSSHAddUser(ctx context.Context, key ssh.PublicKey, subje
 		return nil, errs.NotImplemented("signSSHAddUser: user certificate signing is not enabled")
 	}
 	if err := IsValidForAddUser(subject); err != nil {
-		return nil, errs.Wrap(http.StatusForbidden, err, "signSSHAddUser")
+		return nil, err
 	}
 
 	nonce, err := randutil.ASCII(32)
@@ -503,6 +581,12 @@ func (a *Authority) SignSSHAddUser(ctx context.Context, key ssh.PublicKey, subje
 	var serial uint64
 	if err := binary.Read(rand.Reader, binary.BigEndian, &serial); err != nil {
 		return nil, errs.Wrap(http.StatusInternalServerError, err, "signSSHAddUser: error reading random number")
+	}
+
+	// Attempt to extract the provisioner from the token.
+	var prov provisioner.Interface
+	if token, ok := provisioner.TokenFromContext(ctx); ok {
+		prov, _, _ = a.getProvisionerFromToken(token)
 	}
 
 	signer := a.sshCAUserCertSignKey
@@ -537,7 +621,7 @@ func (a *Authority) SignSSHAddUser(ctx context.Context, key ssh.PublicKey, subje
 	}
 	cert.Signature = sig
 
-	if err = a.db.StoreSSHCertificate(cert); err != nil && err != db.ErrNotImplemented {
+	if err = a.storeRenewedSSHCertificate(prov, subject, cert); err != nil && !errors.Is(err, db.ErrNotImplemented) {
 		return nil, errs.Wrap(http.StatusInternalServerError, err, "signSSHAddUser: error storing certificate in db")
 	}
 
@@ -545,7 +629,7 @@ func (a *Authority) SignSSHAddUser(ctx context.Context, key ssh.PublicKey, subje
 }
 
 // CheckSSHHost checks the given principal has been registered before.
-func (a *Authority) CheckSSHHost(ctx context.Context, principal string, token string) (bool, error) {
+func (a *Authority) CheckSSHHost(ctx context.Context, principal, token string) (bool, error) {
 	if a.sshCheckHostFunc != nil {
 		exists, err := a.sshCheckHostFunc(ctx, principal, token, a.GetRootCertificates())
 		if err != nil {
@@ -556,7 +640,7 @@ func (a *Authority) CheckSSHHost(ctx context.Context, principal string, token st
 	}
 	exists, err := a.db.IsSSHHost(principal)
 	if err != nil {
-		if err == db.ErrNotImplemented {
+		if errors.Is(err, db.ErrNotImplemented) {
 			return false, errs.Wrap(http.StatusNotImplemented, err,
 				"checkSSHHost: isSSHHost is not implemented")
 		}
@@ -568,7 +652,10 @@ func (a *Authority) CheckSSHHost(ctx context.Context, principal string, token st
 }
 
 // GetSSHHosts returns a list of valid host principals.
-func (a *Authority) GetSSHHosts(ctx context.Context, cert *x509.Certificate) ([]Host, error) {
+func (a *Authority) GetSSHHosts(ctx context.Context, cert *x509.Certificate) ([]config.Host, error) {
+	if a.GetConfig().AuthorityConfig.DisableGetSSHHosts {
+		return nil, errs.New(http.StatusNotFound, "ssh hosts list api disabled")
+	}
 	if a.sshGetHostsFunc != nil {
 		hosts, err := a.sshGetHostsFunc(ctx, cert)
 		return hosts, errs.Wrap(http.StatusInternalServerError, err, "getSSHHosts")
@@ -578,9 +665,9 @@ func (a *Authority) GetSSHHosts(ctx context.Context, cert *x509.Certificate) ([]
 		return nil, errs.Wrap(http.StatusInternalServerError, err, "getSSHHosts")
 	}
 
-	hosts := make([]Host, len(hostnames))
+	hosts := make([]config.Host, len(hostnames))
 	for i, hn := range hostnames {
-		hosts[i] = Host{Hostname: hn}
+		hosts[i] = config.Host{Hostname: hn}
 	}
 	return hosts, nil
 }
@@ -599,5 +686,37 @@ func (a *Authority) getAddUserCommand(principal string) string {
 	} else {
 		cmd = a.config.SSH.AddUserCommand
 	}
-	return strings.Replace(cmd, "<principal>", principal, -1)
+	return strings.ReplaceAll(cmd, "<principal>", principal)
+}
+
+func (a *Authority) callEnrichingWebhooksSSH(ctx context.Context, prov provisioner.Interface, webhookCtl webhookController, cr sshutil.CertificateRequest) (err error) {
+	if webhookCtl == nil {
+		return
+	}
+	defer func() { a.meter.SSHWebhookEnriched(prov, err) }()
+
+	var whEnrichReq *webhook.RequestBody
+	if whEnrichReq, err = webhook.NewRequestBody(
+		webhook.WithSSHCertificateRequest(cr),
+	); err == nil {
+		err = webhookCtl.Enrich(ctx, whEnrichReq)
+	}
+
+	return
+}
+
+func (a *Authority) callAuthorizingWebhooksSSH(ctx context.Context, prov provisioner.Interface, webhookCtl webhookController, cert *sshutil.Certificate, certTpl *ssh.Certificate) (err error) {
+	if webhookCtl == nil {
+		return
+	}
+	defer func() { a.meter.SSHWebhookAuthorized(prov, err) }()
+
+	var whAuthBody *webhook.RequestBody
+	if whAuthBody, err = webhook.NewRequestBody(
+		webhook.WithSSHCertificate(cert, certTpl),
+	); err == nil {
+		err = webhookCtl.Authorize(ctx, whAuthBody)
+	}
+
+	return
 }

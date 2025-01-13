@@ -17,6 +17,7 @@ type dbAuthz struct {
 	Identifier   acme.Identifier `json:"identifier"`
 	Status       acme.Status     `json:"status"`
 	Token        string          `json:"token"`
+	Fingerprint  string          `json:"fingerprint,omitempty"`
 	ChallengeIDs []string        `json:"challengeIDs"`
 	Wildcard     bool            `json:"wildcard"`
 	CreatedAt    time.Time       `json:"createdAt"`
@@ -31,7 +32,7 @@ func (ba *dbAuthz) clone() *dbAuthz {
 
 // getDBAuthz retrieves and unmarshals a database representation of the
 // ACME Authorization type.
-func (db *DB) getDBAuthz(ctx context.Context, id string) (*dbAuthz, error) {
+func (db *DB) getDBAuthz(_ context.Context, id string) (*dbAuthz, error) {
 	data, err := db.db.Get(authzTable, []byte(id))
 	if nosql.IsErrNotFound(err) {
 		return nil, acme.NewError(acme.ErrorMalformedType, "authz %s not found", id)
@@ -61,15 +62,16 @@ func (db *DB) GetAuthorization(ctx context.Context, id string) (*acme.Authorizat
 		}
 	}
 	return &acme.Authorization{
-		ID:         dbaz.ID,
-		AccountID:  dbaz.AccountID,
-		Identifier: dbaz.Identifier,
-		Status:     dbaz.Status,
-		Challenges: chs,
-		Wildcard:   dbaz.Wildcard,
-		ExpiresAt:  dbaz.ExpiresAt,
-		Token:      dbaz.Token,
-		Error:      dbaz.Error,
+		ID:          dbaz.ID,
+		AccountID:   dbaz.AccountID,
+		Identifier:  dbaz.Identifier,
+		Status:      dbaz.Status,
+		Challenges:  chs,
+		Wildcard:    dbaz.Wildcard,
+		ExpiresAt:   dbaz.ExpiresAt,
+		Token:       dbaz.Token,
+		Fingerprint: dbaz.Fingerprint,
+		Error:       dbaz.Error,
 	}, nil
 }
 
@@ -97,6 +99,7 @@ func (db *DB) CreateAuthorization(ctx context.Context, az *acme.Authorization) e
 		Identifier:   az.Identifier,
 		ChallengeIDs: chIDs,
 		Token:        az.Token,
+		Fingerprint:  az.Fingerprint,
 		Wildcard:     az.Wildcard,
 	}
 
@@ -111,8 +114,43 @@ func (db *DB) UpdateAuthorization(ctx context.Context, az *acme.Authorization) e
 	}
 
 	nu := old.clone()
-
 	nu.Status = az.Status
+	nu.Fingerprint = az.Fingerprint
 	nu.Error = az.Error
 	return db.save(ctx, old.ID, nu, old, "authz", authzTable)
+}
+
+// GetAuthorizationsByAccountID retrieves and unmarshals ACME authz types from the database.
+func (db *DB) GetAuthorizationsByAccountID(_ context.Context, accountID string) ([]*acme.Authorization, error) {
+	entries, err := db.db.List(authzTable)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error listing authz")
+	}
+	authzs := []*acme.Authorization{}
+	for _, entry := range entries {
+		dbaz := new(dbAuthz)
+		if err = json.Unmarshal(entry.Value, dbaz); err != nil {
+			return nil, errors.Wrapf(err, "error unmarshaling dbAuthz key '%s' into dbAuthz struct", string(entry.Key))
+		}
+		// Filter out all dbAuthzs that don't belong to the accountID. This
+		// could be made more efficient with additional data structures mapping the
+		// Account ID to authorizations. Not trivial to do, though.
+		if dbaz.AccountID != accountID {
+			continue
+		}
+		authzs = append(authzs, &acme.Authorization{
+			ID:          dbaz.ID,
+			AccountID:   dbaz.AccountID,
+			Identifier:  dbaz.Identifier,
+			Status:      dbaz.Status,
+			Challenges:  nil, // challenges not required for current use case
+			Wildcard:    dbaz.Wildcard,
+			ExpiresAt:   dbaz.ExpiresAt,
+			Token:       dbaz.Token,
+			Fingerprint: dbaz.Fingerprint,
+			Error:       dbaz.Error,
+		})
+	}
+
+	return authzs, nil
 }

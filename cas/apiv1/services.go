@@ -1,6 +1,8 @@
 package apiv1
 
 import (
+	"crypto"
+	"crypto/x509"
 	"net/http"
 	"strings"
 )
@@ -13,17 +15,36 @@ type CertificateAuthorityService interface {
 	RevokeCertificate(req *RevokeCertificateRequest) (*RevokeCertificateResponse, error)
 }
 
+// CertificateAuthorityCRLGenerator is an optional interface implemented by CertificateAuthorityService
+// that has a method to create a CRL
+type CertificateAuthorityCRLGenerator interface {
+	CreateCRL(req *CreateCRLRequest) (*CreateCRLResponse, error)
+}
+
 // CertificateAuthorityGetter is an interface implemented by a
 // CertificateAuthorityService that has a method to get the root certificate.
 type CertificateAuthorityGetter interface {
 	GetCertificateAuthority(req *GetCertificateAuthorityRequest) (*GetCertificateAuthorityResponse, error)
 }
 
-// CertificateAuthorityCreator is an interface implamented by a
+// CertificateAuthorityCreator is an interface implemented by a
 // CertificateAuthorityService that has a method to create a new certificate
 // authority.
 type CertificateAuthorityCreator interface {
 	CreateCertificateAuthority(req *CreateCertificateAuthorityRequest) (*CreateCertificateAuthorityResponse, error)
+}
+
+// CertificateAuthoritySigner is an optional interface implemented by a
+// CertificateAuthorityService that has a method that returns a [crypto.Signer]
+// using the same key used to issue certificates.
+type CertificateAuthoritySigner interface {
+	GetSigner() (crypto.Signer, error)
+}
+
+// SignatureAlgorithmGetter is an optional implementation in a crypto.Signer
+// that returns the SignatureAlgorithm to use.
+type SignatureAlgorithmGetter interface {
+	SignatureAlgorithm() x509.SignatureAlgorithm
 }
 
 // Type represents the CAS type used.
@@ -38,6 +59,10 @@ const (
 	CloudCAS = "cloudcas"
 	// StepCAS is a CertificateAuthorityService using another step-ca instance.
 	StepCAS = "stepcas"
+	// VaultCAS is a CertificateAuthorityService using Hasicorp Vault PKI.
+	VaultCAS = "vaultcas"
+	// ExternalCAS is a CertificateAuthorityService using an external injected CA implementation
+	ExternalCAS = "externalcas"
 )
 
 // String returns a string from the type. It will always return the lower case
@@ -50,14 +75,21 @@ func (t Type) String() string {
 	return strings.ToLower(string(t))
 }
 
-// ErrNotImplemented is the type of error returned if an operation is not
-// implemented.
-type ErrNotImplemented struct {
+// TypeOf returns the type of the given CertificateAuthorityService.
+func TypeOf(c CertificateAuthorityService) Type {
+	if ct, ok := c.(interface{ Type() Type }); ok {
+		return ct.Type()
+	}
+	return ExternalCAS
+}
+
+// NotImplementedError is the type of error returned if an operation is not implemented.
+type NotImplementedError struct {
 	Message string
 }
 
-// ErrNotImplemented implements the error interface.
-func (e ErrNotImplemented) Error() string {
+// Error implements the error interface.
+func (e NotImplementedError) Error() string {
 	if e.Message != "" {
 		return e.Message
 	}
@@ -66,6 +98,26 @@ func (e ErrNotImplemented) Error() string {
 
 // StatusCode implements the StatusCoder interface and returns the HTTP 501
 // error.
-func (e ErrNotImplemented) StatusCode() int {
+func (e NotImplementedError) StatusCode() int {
 	return http.StatusNotImplemented
+}
+
+// ValidationError is the type of error returned if request is not properly
+// validated.
+type ValidationError struct {
+	Message string
+}
+
+// NotImplementedError implements the error interface.
+func (e ValidationError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return "bad request"
+}
+
+// StatusCode implements the StatusCoder interface and returns the HTTP 400
+// error.
+func (e ValidationError) StatusCode() int {
+	return http.StatusBadRequest
 }

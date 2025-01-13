@@ -5,7 +5,7 @@ import (
 	"crypto/x509"
 	"time"
 
-	"github.com/smallstep/certificates/kms/apiv1"
+	"go.step.sm/crypto/kms/apiv1"
 )
 
 // CertificateAuthorityType indicates the type of Certificate Authority to
@@ -52,11 +52,21 @@ const (
 
 // CreateCertificateRequest is the request used to sign a new certificate.
 type CreateCertificateRequest struct {
-	Template  *x509.Certificate
-	CSR       *x509.CertificateRequest
-	Lifetime  time.Duration
-	Backdate  time.Duration
-	RequestID string
+	Template       *x509.Certificate
+	CSR            *x509.CertificateRequest
+	Lifetime       time.Duration
+	Backdate       time.Duration
+	RequestID      string
+	Provisioner    *ProvisionerInfo
+	IsCAServerCert bool
+}
+
+// ProvisionerInfo contains information of the provisioner used to authorize a
+// certificate.
+type ProvisionerInfo struct {
+	ID   string
+	Type string
+	Name string
 }
 
 // CreateCertificateResponse is the response to a create certificate request.
@@ -71,6 +81,7 @@ type RenewCertificateRequest struct {
 	CSR       *x509.CertificateRequest
 	Lifetime  time.Duration
 	Backdate  time.Duration
+	Token     string
 	RequestID string
 }
 
@@ -105,8 +116,12 @@ type GetCertificateAuthorityRequest struct {
 // GetCertificateAuthorityResponse is the response that contains
 // the root certificate.
 type GetCertificateAuthorityResponse struct {
-	RootCertificate *x509.Certificate
+	RootCertificate          *x509.Certificate
+	IntermediateCertificates []*x509.Certificate
 }
+
+// CreateKeyRequest is the request used to generate a new key using a KMS.
+type CreateKeyRequest = apiv1.CreateKeyRequest
 
 // CreateCertificateAuthorityRequest is the request used to generate a root or
 // intermediate certificate.
@@ -126,7 +141,7 @@ type CreateCertificateAuthorityRequest struct {
 	// CreateKey defines the KMS CreateKeyRequest to use when creating a new
 	// CertificateAuthority. If CreateKey is nil, a default algorithm will be
 	// used.
-	CreateKey *apiv1.CreateKeyRequest
+	CreateKey *CreateKeyRequest
 }
 
 // CreateCertificateAuthorityResponse is the response for
@@ -136,7 +151,18 @@ type CreateCertificateAuthorityResponse struct {
 	Name             string
 	Certificate      *x509.Certificate
 	CertificateChain []*x509.Certificate
+	KeyName          string
 	PublicKey        crypto.PublicKey
 	PrivateKey       crypto.PrivateKey
 	Signer           crypto.Signer
+}
+
+// CreateCRLRequest is the request to create a Certificate Revocation List.
+type CreateCRLRequest struct {
+	RevocationList *x509.RevocationList
+}
+
+// CreateCRLResponse is the response to a Certificate Revocation List request.
+type CreateCRLResponse struct {
+	CRL []byte //the CRL in DER format
 }

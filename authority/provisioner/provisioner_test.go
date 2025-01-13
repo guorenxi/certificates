@@ -2,12 +2,13 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
-	"github.com/pkg/errors"
-	"github.com/smallstep/assert"
-	"github.com/smallstep/certificates/errs"
+	"github.com/go-jose/go-jose/v3"
+	"github.com/smallstep/certificates/api/render"
+	"github.com/stretchr/testify/assert"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -62,23 +63,17 @@ func TestSanitizeSSHUserPrincipal(t *testing.T) {
 
 func TestDefaultIdentityFunc(t *testing.T) {
 	type test struct {
-		p        Interface
-		email    string
-		err      error
-		identity *Identity
+		p         Interface
+		email     string
+		usernames []string
+		err       error
+		identity  *Identity
 	}
 	tests := map[string]func(*testing.T) test{
 		"fail/unsupported-provisioner": func(t *testing.T) test {
 			return test{
 				p:   &X5C{},
 				err: errors.New("provisioner type '*provisioner.X5C' not supported by identity function"),
-			}
-		},
-		"fail/bad-ssh-regex": func(t *testing.T) test {
-			return test{
-				p:     &OIDC{},
-				email: "$%^#_>@smallstep.com",
-				err:   errors.New("invalid principal '______' from email '$%^#_>@smallstep.com'"),
 			}
 		},
 		"ok": func(t *testing.T) test {
@@ -106,7 +101,7 @@ func TestDefaultIdentityFunc(t *testing.T) {
 			return test{
 				p:        &OIDC{},
 				email:    "John@smallstep.com",
-				identity: &Identity{Usernames: []string{"john", "John@smallstep.com"}},
+				identity: &Identity{Usernames: []string{"john", "John", "John@smallstep.com"}},
 			}
 		},
 		"ok symbol": func(t *testing.T) test {
@@ -116,6 +111,37 @@ func TestDefaultIdentityFunc(t *testing.T) {
 				identity: &Identity{Usernames: []string{"john_doe", "John+Doe", "John+Doe@smallstep.com"}},
 			}
 		},
+		"ok username": func(t *testing.T) test {
+			return test{
+				p:         &OIDC{},
+				email:     "john@smallstep.com",
+				usernames: []string{"johnny"},
+				identity:  &Identity{Usernames: []string{"john", "john@smallstep.com"}},
+			}
+		},
+		"ok usernames": func(t *testing.T) test {
+			return test{
+				p:         &OIDC{},
+				email:     "john@smallstep.com",
+				usernames: []string{"johnny", "js", "", "johnny", ""},
+				identity:  &Identity{Usernames: []string{"john", "john@smallstep.com"}},
+			}
+		},
+		"ok empty username": func(t *testing.T) test {
+			return test{
+				p:         &OIDC{},
+				email:     "john@smallstep.com",
+				usernames: []string{""},
+				identity:  &Identity{Usernames: []string{"john", "john@smallstep.com"}},
+			}
+		},
+		"ok/badname": func(t *testing.T) test {
+			return test{
+				p:        &OIDC{},
+				email:    "$%^#_>@smallstep.com",
+				identity: &Identity{Usernames: []string{"______", "$%^#_>", "$%^#_>@smallstep.com"}},
+			}
+		},
 	}
 	for name, get := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -123,11 +149,11 @@ func TestDefaultIdentityFunc(t *testing.T) {
 			identity, err := DefaultIdentityFunc(context.Background(), tc.p, tc.email)
 			if err != nil {
 				if assert.NotNil(t, tc.err) {
-					assert.Equals(t, tc.err.Error(), err.Error())
+					assert.Equal(t, tc.err.Error(), err.Error())
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
-					assert.Equals(t, identity.Usernames, tc.identity.Usernames)
+					assert.Equal(t, identity.Usernames, tc.identity.Usernames)
 				}
 			}
 		})
@@ -159,7 +185,6 @@ func TestUnimplementedMethods(t *testing.T) {
 		{"x5c/sshRenew", &X5C{}, SSHRenewMethod},
 		{"x5c/sshRekey", &X5C{}, SSHRekeyMethod},
 		{"x5c/sshRevoke", &X5C{}, SSHRekeyMethod},
-		{"acme/revoke", &ACME{}, RevokeMethod},
 		{"acme/sshSign", &ACME{}, SSHSignMethod},
 		{"acme/sshRekey", &ACME{}, SSHRekeyMethod},
 		{"acme/sshRenew", &ACME{}, SSHRenewMethod},
@@ -216,10 +241,45 @@ func TestUnimplementedMethods(t *testing.T) {
 			default:
 				t.Errorf("unexpected method %s", tt.method)
 			}
-			sc, ok := err.(errs.StatusCoder)
-			assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-			assert.Equals(t, sc.StatusCode(), http.StatusUnauthorized)
-			assert.Equals(t, err.Error(), msg)
+			var sc render.StatusCodedError
+			if assert.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface") {
+				assert.Equal(t, http.StatusUnauthorized, sc.StatusCode())
+			}
+			assert.Equal(t, msg, err.Error())
+		})
+	}
+}
+
+func TestUninitialized_MarshalJSON(t *testing.T) {
+	p := &JWK{
+		Name: "bad-provisioner",
+		Type: "JWK",
+		Key: &jose.JSONWebKey{
+			Key: []byte("foo"),
+		},
+	}
+
+	type fields struct {
+		Interface Interface
+		Reason    error
+	}
+	tests := []struct {
+		name      string
+		fields    fields
+		want      []byte
+		assertion assert.ErrorAssertionFunc
+	}{
+		{"ok", fields{p, errors.New("bad key")}, []byte(`{"type":"JWK","name":"bad-provisioner","key":{"kty":"oct","k":"Zm9v"},"state":"Uninitialized","stateReason":"bad key"}`), assert.NoError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := Uninitialized{
+				Interface: tt.fields.Interface,
+				Reason:    tt.fields.Reason,
+			}
+			got, err := p.MarshalJSON()
+			tt.assertion(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
