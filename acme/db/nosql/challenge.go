@@ -6,20 +6,23 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/acme"
+
 	"github.com/smallstep/nosql"
+
+	"github.com/smallstep/certificates/acme"
 )
 
 type dbChallenge struct {
-	ID          string      `json:"id"`
-	AccountID   string      `json:"accountID"`
-	Type        string      `json:"type"`
-	Status      acme.Status `json:"status"`
-	Token       string      `json:"token"`
-	Value       string      `json:"value"`
-	ValidatedAt string      `json:"validatedAt"`
-	CreatedAt   time.Time   `json:"createdAt"`
-	Error       *acme.Error `json:"error"`
+	ID          string             `json:"id"`
+	AccountID   string             `json:"accountID"`
+	Type        acme.ChallengeType `json:"type"`
+	Status      acme.Status        `json:"status"`
+	Token       string             `json:"token"`
+	Value       string             `json:"value"`
+	Target      string             `json:"target,omitempty"`
+	ValidatedAt string             `json:"validatedAt"`
+	CreatedAt   time.Time          `json:"createdAt"`
+	Error       *acme.Error        `json:"error"` // TODO(hs): a bit dangerous; should become db-specific type
 }
 
 func (dbc *dbChallenge) clone() *dbChallenge {
@@ -27,7 +30,7 @@ func (dbc *dbChallenge) clone() *dbChallenge {
 	return &u
 }
 
-func (db *DB) getDBChallenge(ctx context.Context, id string) (*dbChallenge, error) {
+func (db *DB) getDBChallenge(_ context.Context, id string) (*dbChallenge, error) {
 	data, err := db.db.Get(challengeTable, []byte(id))
 	if nosql.IsErrNotFound(err) {
 		return nil, acme.NewError(acme.ErrorMalformedType, "challenge %s not found", id)
@@ -59,6 +62,7 @@ func (db *DB) CreateChallenge(ctx context.Context, ch *acme.Challenge) error {
 		Token:     ch.Token,
 		CreatedAt: clock.Now(),
 		Type:      ch.Type,
+		Target:    ch.Target,
 	}
 
 	return db.save(ctx, ch.ID, dbch, nil, "challenge", challengeTable)
@@ -67,6 +71,7 @@ func (db *DB) CreateChallenge(ctx context.Context, ch *acme.Challenge) error {
 // GetChallenge retrieves and unmarshals an ACME challenge type from the database.
 // Implements the acme.DB GetChallenge interface.
 func (db *DB) GetChallenge(ctx context.Context, id, authzID string) (*acme.Challenge, error) {
+	_ = authzID // unused input
 	dbch, err := db.getDBChallenge(ctx, id)
 	if err != nil {
 		return nil, err
@@ -81,6 +86,7 @@ func (db *DB) GetChallenge(ctx context.Context, id, authzID string) (*acme.Chall
 		Token:       dbch.Token,
 		Error:       dbch.Error,
 		ValidatedAt: dbch.ValidatedAt,
+		Target:      dbch.Target,
 	}
 	return ch, nil
 }

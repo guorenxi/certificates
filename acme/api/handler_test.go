@@ -3,24 +3,52 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
-	"github.com/smallstep/assert"
-	"github.com/smallstep/certificates/acme"
+
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/pemutil"
+
+	"github.com/smallstep/assert"
+	"github.com/smallstep/certificates/acme"
+	"github.com/smallstep/certificates/authority/provisioner"
 )
+
+type mockClient struct {
+	get       func(url string) (*http.Response, error)
+	lookupTxt func(name string) ([]string, error)
+	tlsDial   func(network, addr string, config *tls.Config) (*tls.Conn, error)
+}
+
+func (m *mockClient) Get(u string) (*http.Response, error)    { return m.get(u) }
+func (m *mockClient) LookupTxt(name string) ([]string, error) { return m.lookupTxt(name) }
+func (m *mockClient) TLSDial(network, addr string, config *tls.Config) (*tls.Conn, error) {
+	return m.tlsDial(network, addr, config)
+}
+
+func mockMustAuthority(t *testing.T, a acme.CertificateAuthority) {
+	t.Helper()
+	fn := mustAuthority
+	t.Cleanup(func() {
+		mustAuthority = fn
+	})
+	mustAuthority = func(ctx context.Context) acme.CertificateAuthority {
+		return a
+	}
+}
 
 func TestHandler_GetNonce(t *testing.T) {
 	tests := []struct {
@@ -32,14 +60,14 @@ func TestHandler_GetNonce(t *testing.T) {
 	}
 
 	// Request with chi context
-	req := httptest.NewRequest("GET", "http://ca.smallstep.com/nonce", nil)
+	req := httptest.NewRequest("GET", "http://ca.smallstep.com/nonce", http.NoBody)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := &Handler{}
+			// h := &Handler{}
 			w := httptest.NewRecorder()
 			req.Method = tt.name
-			h.GetNonce(w, req)
+			GetNonce(w, req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
@@ -50,29 +78,95 @@ func TestHandler_GetNonce(t *testing.T) {
 }
 
 func TestHandler_GetDirectory(t *testing.T) {
-	linker := NewLinker("ca.smallstep.com", "acme")
-
-	prov := newProv()
-	provName := url.PathEscape(prov.GetName())
-	baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
-	ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
-	ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
-
-	expDir := Directory{
-		NewNonce:   fmt.Sprintf("%s/acme/%s/new-nonce", baseURL.String(), provName),
-		NewAccount: fmt.Sprintf("%s/acme/%s/new-account", baseURL.String(), provName),
-		NewOrder:   fmt.Sprintf("%s/acme/%s/new-order", baseURL.String(), provName),
-		RevokeCert: fmt.Sprintf("%s/acme/%s/revoke-cert", baseURL.String(), provName),
-		KeyChange:  fmt.Sprintf("%s/acme/%s/key-change", baseURL.String(), provName),
-	}
-
+	linker := acme.NewLinker("ca.smallstep.com", "acme")
+	_ = linker
 	type test struct {
+		ctx        context.Context
 		statusCode int
+		dir        Directory
 		err        *acme.Error
 	}
 	var tests = map[string]func(t *testing.T) test{
-		"ok": func(t *testing.T) test {
+		"fail/no-provisioner": func(t *testing.T) test {
 			return test{
+				ctx:        context.Background(),
+				statusCode: 500,
+				err:        acme.NewErrorISE("provisioner is not in context"),
+			}
+		},
+		"fail/different-provisioner": func(t *testing.T) test {
+			ctx := acme.NewProvisionerContext(context.Background(), &fakeProvisioner{})
+			return test{
+				ctx:        ctx,
+				statusCode: 500,
+				err:        acme.NewErrorISE("provisioner in context is not an ACME provisioner"),
+			}
+		},
+		"ok": func(t *testing.T) test {
+			prov := newProv()
+			provName := url.PathEscape(prov.GetName())
+			baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			expDir := Directory{
+				NewNonce:   fmt.Sprintf("%s/acme/%s/new-nonce", baseURL.String(), provName),
+				NewAccount: fmt.Sprintf("%s/acme/%s/new-account", baseURL.String(), provName),
+				NewOrder:   fmt.Sprintf("%s/acme/%s/new-order", baseURL.String(), provName),
+				RevokeCert: fmt.Sprintf("%s/acme/%s/revoke-cert", baseURL.String(), provName),
+				KeyChange:  fmt.Sprintf("%s/acme/%s/key-change", baseURL.String(), provName),
+			}
+			return test{
+				ctx:        ctx,
+				dir:        expDir,
+				statusCode: 200,
+			}
+		},
+		"ok/eab-required": func(t *testing.T) test {
+			prov := newACMEProv(t)
+			prov.RequireEAB = true
+			provName := url.PathEscape(prov.GetName())
+			baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			expDir := Directory{
+				NewNonce:   fmt.Sprintf("%s/acme/%s/new-nonce", baseURL.String(), provName),
+				NewAccount: fmt.Sprintf("%s/acme/%s/new-account", baseURL.String(), provName),
+				NewOrder:   fmt.Sprintf("%s/acme/%s/new-order", baseURL.String(), provName),
+				RevokeCert: fmt.Sprintf("%s/acme/%s/revoke-cert", baseURL.String(), provName),
+				KeyChange:  fmt.Sprintf("%s/acme/%s/key-change", baseURL.String(), provName),
+				Meta: &Meta{
+					ExternalAccountRequired: true,
+				},
+			}
+			return test{
+				ctx:        ctx,
+				dir:        expDir,
+				statusCode: 200,
+			}
+		},
+		"ok/full-meta": func(t *testing.T) test {
+			prov := newACMEProv(t)
+			prov.TermsOfService = "https://terms.ca.local/"
+			prov.Website = "https://ca.local/"
+			prov.CaaIdentities = []string{"ca.local"}
+			prov.RequireEAB = true
+			provName := url.PathEscape(prov.GetName())
+			baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			expDir := Directory{
+				NewNonce:   fmt.Sprintf("%s/acme/%s/new-nonce", baseURL.String(), provName),
+				NewAccount: fmt.Sprintf("%s/acme/%s/new-account", baseURL.String(), provName),
+				NewOrder:   fmt.Sprintf("%s/acme/%s/new-order", baseURL.String(), provName),
+				RevokeCert: fmt.Sprintf("%s/acme/%s/revoke-cert", baseURL.String(), provName),
+				KeyChange:  fmt.Sprintf("%s/acme/%s/key-change", baseURL.String(), provName),
+				Meta: &Meta{
+					TermsOfService:          "https://terms.ca.local/",
+					Website:                 "https://ca.local/",
+					CaaIdentities:           []string{"ca.local"},
+					ExternalAccountRequired: true,
+				},
+			}
+			return test{
+				ctx:        ctx,
+				dir:        expDir,
 				statusCode: 200,
 			}
 		},
@@ -80,16 +174,16 @@ func TestHandler_GetDirectory(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{linker: linker}
-			req := httptest.NewRequest("GET", "/foo/bar", nil)
+			ctx := acme.NewLinkerContext(tc.ctx, acme.NewLinker("test.ca.smallstep.com", "acme"))
+			req := httptest.NewRequest("GET", "/foo/bar", http.NoBody)
 			req = req.WithContext(ctx)
 			w := httptest.NewRecorder()
-			h.GetDirectory(w, req)
+			GetDirectory(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -99,13 +193,14 @@ func TestHandler_GetDirectory(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
 				var dir Directory
 				json.Unmarshal(bytes.TrimSpace(body), &dir)
-				assert.Equals(t, dir, expDir)
+				if !cmp.Equal(tc.dir, dir) {
+					t.Errorf("GetDirectory() diff =\n%s", cmp.Diff(tc.dir, dir))
+				}
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/json"})
 			}
 		})
@@ -148,7 +243,7 @@ func TestHandler_GetAuthorization(t *testing.T) {
 	// Request with chi context
 	chiCtx := chi.NewRouteContext()
 	chiCtx.URLParams.Add("authzID", az.ID)
-	url := fmt.Sprintf("%s/acme/%s/authz/%s",
+	u := fmt.Sprintf("%s/acme/%s/authz/%s",
 		baseURL.String(), provName, az.ID)
 
 	type test struct {
@@ -167,7 +262,7 @@ func TestHandler_GetAuthorization(t *testing.T) {
 			}
 		},
 		"fail/nil-account": func(t *testing.T) test {
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, accContextKey, nil)
 			return test{
 				db:         &acme.MockDB{},
@@ -233,10 +328,9 @@ func TestHandler_GetAuthorization(t *testing.T) {
 		},
 		"ok": func(t *testing.T) test {
 			acc := &acme.Account{ID: "accID"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, accContextKey, acc)
 			ctx = context.WithValue(ctx, chi.RouteCtxKey, chiCtx)
-			ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
 			return test{
 				db: &acme.MockDB{
 					MockGetAuthorization: func(ctx context.Context, id string) (*acme.Authorization, error) {
@@ -252,16 +346,16 @@ func TestHandler_GetAuthorization(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{db: tc.db, linker: NewLinker("dns", "acme")}
-			req := httptest.NewRequest("GET", "/foo/bar", nil)
-			req = req.WithContext(tc.ctx)
+			ctx := acme.NewContext(tc.ctx, tc.db, nil, acme.NewLinker("test.ca.smallstep.com", "acme"), nil)
+			req := httptest.NewRequest("GET", "/foo/bar", http.NoBody)
+			req = req.WithContext(ctx)
 			w := httptest.NewRecorder()
-			h.GetAuthorization(w, req)
+			GetAuthorization(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -271,7 +365,6 @@ func TestHandler_GetAuthorization(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
@@ -280,7 +373,7 @@ func TestHandler_GetAuthorization(t *testing.T) {
 				expB, err := json.Marshal(az)
 				assert.FatalError(t, err)
 				assert.Equals(t, bytes.TrimSpace(body), expB)
-				assert.Equals(t, res.Header["Location"], []string{url})
+				assert.Equals(t, res.Header["Location"], []string{u})
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/json"})
 			}
 		})
@@ -314,7 +407,7 @@ func TestHandler_GetCertificate(t *testing.T) {
 	// Request with chi context
 	chiCtx := chi.NewRouteContext()
 	chiCtx.URLParams.Add("certID", certID)
-	url := fmt.Sprintf("%s/acme/%s/certificate/%s",
+	u := fmt.Sprintf("%s/acme/%s/certificate/%s",
 		baseURL.String(), provName, certID)
 
 	type test struct {
@@ -395,16 +488,16 @@ func TestHandler_GetCertificate(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{db: tc.db}
-			req := httptest.NewRequest("GET", url, nil)
-			req = req.WithContext(tc.ctx)
+			ctx := acme.NewDatabaseContext(tc.ctx, tc.db)
+			req := httptest.NewRequest("GET", u, http.NoBody)
+			req = req.WithContext(ctx)
 			w := httptest.NewRecorder()
-			h.GetCertificate(w, req)
+			GetCertificate(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -414,12 +507,11 @@ func TestHandler_GetCertificate(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.HasPrefix(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
 				assert.Equals(t, bytes.TrimSpace(body), bytes.TrimSpace(certBytes))
-				assert.Equals(t, res.Header["Content-Type"], []string{"application/pem-certificate-chain; charset=utf-8"})
+				assert.Equals(t, res.Header["Content-Type"], []string{"application/pem-certificate-chain"})
 			}
 		})
 	}
@@ -434,12 +526,12 @@ func TestHandler_GetChallenge(t *testing.T) {
 
 	baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
 
-	url := fmt.Sprintf("%s/acme/%s/challenge/%s/%s",
+	u := fmt.Sprintf("%s/acme/%s/challenge/%s/%s",
 		baseURL.String(), provName, "authzID", "chID")
 
 	type test struct {
 		db         acme.DB
-		vco        *acme.ValidateChallengeOptions
+		vc         acme.Client
 		ctx        context.Context
 		statusCode int
 		ch         *acme.Challenge
@@ -448,6 +540,7 @@ func TestHandler_GetChallenge(t *testing.T) {
 	var tests = map[string]func(t *testing.T) test{
 		"fail/no-account": func(t *testing.T) test {
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        context.Background(),
 				statusCode: 400,
 				err:        acme.NewError(acme.ErrorAccountDoesNotExistType, "account does not exist"),
@@ -455,6 +548,7 @@ func TestHandler_GetChallenge(t *testing.T) {
 		},
 		"fail/nil-account": func(t *testing.T) test {
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        context.WithValue(context.Background(), accContextKey, nil),
 				statusCode: 400,
 				err:        acme.NewError(acme.ErrorAccountDoesNotExistType, "account does not exist"),
@@ -464,6 +558,7 @@ func TestHandler_GetChallenge(t *testing.T) {
 			acc := &acme.Account{ID: "accID"}
 			ctx := context.WithValue(context.Background(), accContextKey, acc)
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        ctx,
 				statusCode: 500,
 				err:        acme.NewErrorISE("payload expected in request context"),
@@ -471,10 +566,11 @@ func TestHandler_GetChallenge(t *testing.T) {
 		},
 		"fail/nil-payload": func(t *testing.T) test {
 			acc := &acme.Account{ID: "accID"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, accContextKey, acc)
 			ctx = context.WithValue(ctx, payloadContextKey, nil)
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        ctx,
 				statusCode: 500,
 				err:        acme.NewErrorISE("payload expected in request context"),
@@ -482,7 +578,7 @@ func TestHandler_GetChallenge(t *testing.T) {
 		},
 		"fail/db.GetChallenge-error": func(t *testing.T) test {
 			acc := &acme.Account{ID: "accID"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, accContextKey, acc)
 			ctx = context.WithValue(ctx, payloadContextKey, &payloadInfo{isEmptyJSON: true})
 			ctx = context.WithValue(ctx, chi.RouteCtxKey, chiCtx)
@@ -501,7 +597,7 @@ func TestHandler_GetChallenge(t *testing.T) {
 		},
 		"fail/account-id-mismatch": func(t *testing.T) test {
 			acc := &acme.Account{ID: "accID"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, accContextKey, acc)
 			ctx = context.WithValue(ctx, payloadContextKey, &payloadInfo{isEmptyJSON: true})
 			ctx = context.WithValue(ctx, chi.RouteCtxKey, chiCtx)
@@ -520,7 +616,7 @@ func TestHandler_GetChallenge(t *testing.T) {
 		},
 		"fail/no-jwk": func(t *testing.T) test {
 			acc := &acme.Account{ID: "accID"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, accContextKey, acc)
 			ctx = context.WithValue(ctx, payloadContextKey, &payloadInfo{isEmptyJSON: true})
 			ctx = context.WithValue(ctx, chi.RouteCtxKey, chiCtx)
@@ -539,7 +635,7 @@ func TestHandler_GetChallenge(t *testing.T) {
 		},
 		"fail/nil-jwk": func(t *testing.T) test {
 			acc := &acme.Account{ID: "accID"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, accContextKey, acc)
 			ctx = context.WithValue(ctx, payloadContextKey, &payloadInfo{isEmptyJSON: true})
 			ctx = context.WithValue(ctx, jwkContextKey, nil)
@@ -559,7 +655,7 @@ func TestHandler_GetChallenge(t *testing.T) {
 		},
 		"fail/validate-challenge-error": func(t *testing.T) test {
 			acc := &acme.Account{ID: "accID"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, accContextKey, acc)
 			ctx = context.WithValue(ctx, payloadContextKey, &payloadInfo{isEmptyJSON: true})
 			_jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
@@ -574,21 +670,21 @@ func TestHandler_GetChallenge(t *testing.T) {
 						assert.Equals(t, azID, "authzID")
 						return &acme.Challenge{
 							Status:    acme.StatusPending,
-							Type:      "http-01",
+							Type:      acme.HTTP01,
 							AccountID: "accID",
 						}, nil
 					},
 					MockUpdateChallenge: func(ctx context.Context, ch *acme.Challenge) error {
 						assert.Equals(t, ch.Status, acme.StatusPending)
-						assert.Equals(t, ch.Type, "http-01")
+						assert.Equals(t, ch.Type, acme.HTTP01)
 						assert.Equals(t, ch.AccountID, "accID")
 						assert.Equals(t, ch.AuthorizationID, "authzID")
 						assert.HasSuffix(t, ch.Error.Type, acme.ErrorConnectionType.String())
 						return acme.NewErrorISE("force")
 					},
 				},
-				vco: &acme.ValidateChallengeOptions{
-					HTTPGet: func(string) (*http.Response, error) {
+				vc: &mockClient{
+					get: func(string) (*http.Response, error) {
 						return nil, errors.New("force")
 					},
 				},
@@ -599,14 +695,13 @@ func TestHandler_GetChallenge(t *testing.T) {
 		},
 		"ok": func(t *testing.T) test {
 			acc := &acme.Account{ID: "accID"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, accContextKey, acc)
 			ctx = context.WithValue(ctx, payloadContextKey, &payloadInfo{isEmptyJSON: true})
 			_jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
 			assert.FatalError(t, err)
 			_pub := _jwk.Public()
 			ctx = context.WithValue(ctx, jwkContextKey, &_pub)
-			ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
 			ctx = context.WithValue(ctx, chi.RouteCtxKey, chiCtx)
 			return test{
 				db: &acme.MockDB{
@@ -616,13 +711,13 @@ func TestHandler_GetChallenge(t *testing.T) {
 						return &acme.Challenge{
 							ID:        "chID",
 							Status:    acme.StatusPending,
-							Type:      "http-01",
+							Type:      acme.HTTP01,
 							AccountID: "accID",
 						}, nil
 					},
 					MockUpdateChallenge: func(ctx context.Context, ch *acme.Challenge) error {
 						assert.Equals(t, ch.Status, acme.StatusPending)
-						assert.Equals(t, ch.Type, "http-01")
+						assert.Equals(t, ch.Type, acme.HTTP01)
 						assert.Equals(t, ch.AccountID, "accID")
 						assert.Equals(t, ch.AuthorizationID, "authzID")
 						assert.HasSuffix(t, ch.Error.Type, acme.ErrorConnectionType.String())
@@ -633,13 +728,13 @@ func TestHandler_GetChallenge(t *testing.T) {
 					ID:              "chID",
 					Status:          acme.StatusPending,
 					AuthorizationID: "authzID",
-					Type:            "http-01",
+					Type:            acme.HTTP01,
 					AccountID:       "accID",
-					URL:             url,
+					URL:             u,
 					Error:           acme.NewError(acme.ErrorConnectionType, "force"),
 				},
-				vco: &acme.ValidateChallengeOptions{
-					HTTPGet: func(string) (*http.Response, error) {
+				vc: &mockClient{
+					get: func(string) (*http.Response, error) {
 						return nil, errors.New("force")
 					},
 				},
@@ -651,16 +746,16 @@ func TestHandler_GetChallenge(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{db: tc.db, linker: NewLinker("dns", "acme"), validateChallengeOptions: tc.vco}
-			req := httptest.NewRequest("GET", url, nil)
-			req = req.WithContext(tc.ctx)
+			ctx := acme.NewContext(tc.ctx, tc.db, nil, acme.NewLinker("test.ca.smallstep.com", "acme"), nil)
+			req := httptest.NewRequest("GET", u, http.NoBody)
+			req = req.WithContext(ctx)
 			w := httptest.NewRecorder()
-			h.GetChallenge(w, req)
+			GetChallenge(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -670,7 +765,6 @@ func TestHandler_GetChallenge(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
@@ -678,8 +772,94 @@ func TestHandler_GetChallenge(t *testing.T) {
 				assert.FatalError(t, err)
 				assert.Equals(t, bytes.TrimSpace(body), expB)
 				assert.Equals(t, res.Header["Link"], []string{fmt.Sprintf("<%s/acme/%s/authz/%s>;rel=\"up\"", baseURL, provName, "authzID")})
-				assert.Equals(t, res.Header["Location"], []string{url})
+				assert.Equals(t, res.Header["Location"], []string{u})
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/json"})
+			}
+		})
+	}
+}
+
+func Test_createMetaObject(t *testing.T) {
+	tests := []struct {
+		name string
+		p    *provisioner.ACME
+		want *Meta
+	}{
+		{
+			name: "no-meta",
+			p: &provisioner.ACME{
+				Type: "ACME",
+				Name: "acme",
+			},
+			want: nil,
+		},
+		{
+			name: "terms-of-service",
+			p: &provisioner.ACME{
+				Type:           "ACME",
+				Name:           "acme",
+				TermsOfService: "https://terms.ca.local",
+			},
+			want: &Meta{
+				TermsOfService: "https://terms.ca.local",
+			},
+		},
+		{
+			name: "website",
+			p: &provisioner.ACME{
+				Type:    "ACME",
+				Name:    "acme",
+				Website: "https://ca.local",
+			},
+			want: &Meta{
+				Website: "https://ca.local",
+			},
+		},
+		{
+			name: "caa",
+			p: &provisioner.ACME{
+				Type:          "ACME",
+				Name:          "acme",
+				CaaIdentities: []string{"ca.local", "ca.remote"},
+			},
+			want: &Meta{
+				CaaIdentities: []string{"ca.local", "ca.remote"},
+			},
+		},
+		{
+			name: "require-eab",
+			p: &provisioner.ACME{
+				Type:       "ACME",
+				Name:       "acme",
+				RequireEAB: true,
+			},
+			want: &Meta{
+				ExternalAccountRequired: true,
+			},
+		},
+		{
+			name: "full-meta",
+			p: &provisioner.ACME{
+				Type:           "ACME",
+				Name:           "acme",
+				TermsOfService: "https://terms.ca.local",
+				Website:        "https://ca.local",
+				CaaIdentities:  []string{"ca.local", "ca.remote"},
+				RequireEAB:     true,
+			},
+			want: &Meta{
+				TermsOfService:          "https://terms.ca.local",
+				Website:                 "https://ca.local",
+				CaaIdentities:           []string{"ca.local", "ca.remote"},
+				ExternalAccountRequired: true,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := createMetaObject(tt.p)
+			if !cmp.Equal(tt.want, got) {
+				t.Errorf("createMetaObject() diff =\n%s", cmp.Diff(tt.want, got))
 			}
 		})
 	}

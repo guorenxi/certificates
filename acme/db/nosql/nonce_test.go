@@ -67,8 +67,8 @@ func TestDB_CreateNonce(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
-			if n, err := db.CreateNonce(context.Background()); err != nil {
+			d := DB{db: tc.db}
+			if n, err := d.CreateNonce(context.Background()); err != nil {
 				if assert.NotNil(t, tc.err) {
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -144,18 +144,18 @@ func TestDB_DeleteNonce(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
-			if err := db.DeleteNonce(context.Background(), acme.Nonce(nonceID)); err != nil {
-				switch k := err.(type) {
-				case *acme.Error:
+			d := DB{db: tc.db}
+			if err := d.DeleteNonce(context.Background(), acme.Nonce(nonceID)); err != nil {
+				var ae *acme.Error
+				if errors.As(err, &ae) {
 					if assert.NotNil(t, tc.acmeErr) {
-						assert.Equals(t, k.Type, tc.acmeErr.Type)
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
-						assert.Equals(t, k.Status, tc.acmeErr.Status)
-						assert.Equals(t, k.Err.Error(), tc.acmeErr.Err.Error())
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, ae.Type, tc.acmeErr.Type)
+						assert.Equals(t, ae.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, ae.Status, tc.acmeErr.Status)
+						assert.Equals(t, ae.Err.Error(), tc.acmeErr.Err.Error())
+						assert.Equals(t, ae.Detail, tc.acmeErr.Detail)
 					}
-				default:
+				} else {
 					if assert.NotNil(t, tc.err) {
 						assert.HasPrefix(t, err.Error(), tc.err.Error())
 					}

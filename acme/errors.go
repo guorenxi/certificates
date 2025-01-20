@@ -3,13 +3,10 @@ package acme
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
-	"os"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/certificates/logging"
+	"github.com/smallstep/certificates/api/render"
 )
 
 // ProblemType is the type of the ACME problem.
@@ -20,6 +17,8 @@ const (
 	ErrorAccountDoesNotExistType ProblemType = iota
 	// ErrorAlreadyRevokedType request specified a certificate to be revoked that has already been revoked
 	ErrorAlreadyRevokedType
+	// ErrorBadAttestationStatementType WebAuthn attestation statement could not be verified
+	ErrorBadAttestationStatementType
 	// ErrorBadCSRType CSR is unacceptable (e.g., due to a short key)
 	ErrorBadCSRType
 	// ErrorBadNonceType client sent an unacceptable anti-replay nonce
@@ -76,6 +75,8 @@ func (ap ProblemType) String() string {
 		return "accountDoesNotExist"
 	case ErrorAlreadyRevokedType:
 		return "alreadyRevoked"
+	case ErrorBadAttestationStatementType:
+		return "badAttestationStatement"
 	case ErrorBadCSRType:
 		return "badCSR"
 	case ErrorBadNonceType:
@@ -147,7 +148,7 @@ var (
 		},
 		ErrorAlreadyRevokedType: {
 			typ:     officialACMEPrefix + ErrorAlreadyRevokedType.String(),
-			details: "Certificate already Revoked",
+			details: "Certificate already revoked",
 			status:  400,
 		},
 		ErrorBadCSRType: {
@@ -173,6 +174,11 @@ var (
 		ErrorBadSignatureAlgorithmType: {
 			typ:     officialACMEPrefix + ErrorBadSignatureAlgorithmType.String(),
 			details: "The JWS was signed with an algorithm the server does not support",
+			status:  400,
+		},
+		ErrorBadAttestationStatementType: {
+			typ:     officialACMEPrefix + ErrorBadAttestationStatementType.String(),
+			details: "Attestation statement cannot be verified",
 			status:  400,
 		},
 		ErrorCaaType: {
@@ -264,19 +270,75 @@ var (
 	}
 )
 
-// Error represents an ACME
+// Error represents an ACME Error
 type Error struct {
-	Type        string        `json:"type"`
-	Detail      string        `json:"detail"`
-	Subproblems []interface{} `json:"subproblems,omitempty"`
-	Identifier  interface{}   `json:"identifier,omitempty"`
-	Err         error         `json:"-"`
-	Status      int           `json:"-"`
+	Type        string       `json:"type"`
+	Detail      string       `json:"detail"`
+	Subproblems []Subproblem `json:"subproblems,omitempty"`
+	Err         error        `json:"-"`
+	Status      int          `json:"-"`
 }
 
-// NewError creates a new Error type.
-func NewError(pt ProblemType, msg string, args ...interface{}) *Error {
+// Subproblem represents an ACME subproblem. It's fairly
+// similar to an ACME error, but differs in that it can't
+// include subproblems itself, the error is reflected
+// in the Detail property and doesn't have a Status.
+type Subproblem struct {
+	Type   string `json:"type"`
+	Detail string `json:"detail"`
+	// The "identifier" field MUST NOT be present at the top level in ACME
+	// problem documents.  It can only be present in subproblems.
+	// Subproblems need not all have the same type, and they do not need to
+	// match the top level type.
+	Identifier *Identifier `json:"identifier,omitempty"`
+}
+
+// NewError creates a new Error.
+func NewError(pt ProblemType, msg string, args ...any) *Error {
 	return newError(pt, errors.Errorf(msg, args...))
+}
+
+// NewDetailedError creates a new Error that includes the error
+// message in the details, providing more information to the
+// ACME client.
+func NewDetailedError(pt ProblemType, msg string, args ...any) *Error {
+	return NewError(pt, msg, args...).withDetail()
+}
+
+func (e *Error) withDetail() *Error {
+	if e == nil || e.Status >= 500 || e.Err == nil {
+		return e
+	}
+
+	e.Detail = fmt.Sprintf("%s: %s", e.Detail, e.Err)
+	return e
+}
+
+// AddSubproblems adds the Subproblems to Error. It
+// returns the Error, allowing for fluent addition.
+func (e *Error) AddSubproblems(subproblems ...Subproblem) *Error {
+	e.Subproblems = append(e.Subproblems, subproblems...)
+	return e
+}
+
+// NewSubproblem creates a new Subproblem. The msg and args
+// are used to create a new error, which is set as the Detail, allowing
+// for more detailed error messages to be returned to the ACME client.
+func NewSubproblem(pt ProblemType, msg string, args ...any) Subproblem {
+	e := newError(pt, fmt.Errorf(msg, args...))
+	s := Subproblem{
+		Type:   e.Type,
+		Detail: e.Err.Error(),
+	}
+	return s
+}
+
+// NewSubproblemWithIdentifier creates a new Subproblem with a specific ACME
+// Identifier. It calls NewSubproblem and sets the Identifier.
+func NewSubproblemWithIdentifier(pt ProblemType, identifier Identifier, msg string, args ...any) Subproblem {
+	s := NewSubproblem(pt, msg, args...)
+	s.Identifier = &identifier
+	return s
 }
 
 func newError(pt ProblemType, err error) *Error {
@@ -300,16 +362,17 @@ func newError(pt ProblemType, err error) *Error {
 }
 
 // NewErrorISE creates a new ErrorServerInternalType Error.
-func NewErrorISE(msg string, args ...interface{}) *Error {
+func NewErrorISE(msg string, args ...any) *Error {
 	return NewError(ErrorServerInternalType, msg, args...)
 }
 
 // WrapError attempts to wrap the internal error.
-func WrapError(typ ProblemType, err error, msg string, args ...interface{}) *Error {
-	switch e := err.(type) {
-	case nil:
+func WrapError(typ ProblemType, err error, msg string, args ...any) *Error {
+	var e *Error
+	switch {
+	case err == nil:
 		return nil
-	case *Error:
+	case errors.As(err, &e):
 		if e.Err == nil {
 			e.Err = errors.Errorf(msg+"; "+e.Detail, args...)
 		} else {
@@ -321,8 +384,12 @@ func WrapError(typ ProblemType, err error, msg string, args ...interface{}) *Err
 	}
 }
 
+func WrapDetailedError(typ ProblemType, err error, msg string, args ...any) *Error {
+	return WrapError(typ, err, msg, args...).withDetail()
+}
+
 // WrapErrorISE shortcut to wrap an internal server error type.
-func WrapErrorISE(err error, msg string, args ...interface{}) *Error {
+func WrapErrorISE(err error, msg string, args ...any) *Error {
 	return WrapError(ErrorServerInternalType, err, msg, args...)
 }
 
@@ -331,9 +398,12 @@ func (e *Error) StatusCode() int {
 	return e.Status
 }
 
-// Error allows AError to implement the error interface.
+// Error implements the error interface.
 func (e *Error) Error() string {
-	return e.Detail
+	if e.Err == nil {
+		return e.Detail
+	}
+	return e.Err.Error()
 }
 
 // Cause returns the internal error and implements the Causer interface.
@@ -345,7 +415,7 @@ func (e *Error) Cause() error {
 }
 
 // ToLog implements the EnableLogger interface.
-func (e *Error) ToLog() (interface{}, error) {
+func (e *Error) ToLog() (any, error) {
 	b, err := json.Marshal(e)
 	if err != nil {
 		return nil, WrapErrorISE(err, "error marshaling acme.Error for logging")
@@ -353,26 +423,8 @@ func (e *Error) ToLog() (interface{}, error) {
 	return string(b), nil
 }
 
-// WriteError writes to w a JSON representation of the given error.
-func WriteError(w http.ResponseWriter, err *Error) {
+// Render implements render.RenderableError for Error.
+func (e *Error) Render(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/problem+json")
-	w.WriteHeader(err.StatusCode())
-
-	// Write errors in the response writer
-	if rl, ok := w.(logging.ResponseLogger); ok {
-		rl.WithFields(map[string]interface{}{
-			"error": err.Err,
-		})
-		if os.Getenv("STEPDEBUG") == "1" {
-			if e, ok := err.Err.(errs.StackTracer); ok {
-				rl.WithFields(map[string]interface{}{
-					"stack-trace": fmt.Sprintf("%+v", e),
-				})
-			}
-		}
-	}
-
-	if err := json.NewEncoder(w).Encode(err); err != nil {
-		log.Println(err)
-	}
+	render.JSONStatus(w, r, e, e.StatusCode())
 }

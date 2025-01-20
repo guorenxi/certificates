@@ -19,9 +19,7 @@ const defaultValidity = 5 * time.Minute
 
 // timeNow returns the current time.
 // This method is used for unit testing purposes.
-var timeNow = func() time.Time {
-	return time.Now()
-}
+var timeNow = time.Now
 
 type x5cIssuer struct {
 	caURL    *url.URL
@@ -48,13 +46,13 @@ func newX5CIssuer(caURL *url.URL, cfg *apiv1.CertificateIssuer) (*x5cIssuer, err
 	}, nil
 }
 
-func (i *x5cIssuer) SignToken(subject string, sans []string) (string, error) {
+func (i *x5cIssuer) SignToken(subject string, sans []string, info *raInfo) (string, error) {
 	aud := i.caURL.ResolveReference(&url.URL{
 		Path:     "/1.0/sign",
 		Fragment: "x5c/" + i.issuer,
 	}).String()
 
-	return i.createToken(aud, subject, sans)
+	return i.createToken(aud, subject, sans, info)
 }
 
 func (i *x5cIssuer) RevokeToken(subject string) (string, error) {
@@ -63,7 +61,7 @@ func (i *x5cIssuer) RevokeToken(subject string) (string, error) {
 		Fragment: "x5c/" + i.issuer,
 	}).String()
 
-	return i.createToken(aud, subject, nil)
+	return i.createToken(aud, subject, nil, nil)
 }
 
 func (i *x5cIssuer) Lifetime(d time.Duration) time.Duration {
@@ -78,7 +76,7 @@ func (i *x5cIssuer) Lifetime(d time.Duration) time.Duration {
 	return d
 }
 
-func (i *x5cIssuer) createToken(aud, sub string, sans []string) (string, error) {
+func (i *x5cIssuer) createToken(aud, sub string, sans []string, info *raInfo) (string, error) {
 	signer, err := newX5CSigner(i.certFile, i.keyFile, i.password)
 	if err != nil {
 		return "", err
@@ -94,6 +92,13 @@ func (i *x5cIssuer) createToken(aud, sub string, sans []string) (string, error) 
 	if len(sans) > 0 {
 		builder = builder.Claims(map[string]interface{}{
 			"sans": sans,
+		})
+	}
+	if info != nil {
+		builder = builder.Claims(map[string]interface{}{
+			"step": map[string]interface{}{
+				"ra": info,
+			},
 		})
 	}
 
@@ -143,7 +148,11 @@ func newX5CSigner(certFile, keyFile, password string) (jose.Signer, error) {
 	if err != nil {
 		return nil, err
 	}
-	certs, err := jose.ValidateX5C(certFile, signer)
+	certs, err := pemutil.ReadCertificateBundle(certFile)
+	if err != nil {
+		return nil, errors.Wrap(err, "error reading x5c certificate chain")
+	}
+	certStrs, err := jose.ValidateX5C(certs, signer)
 	if err != nil {
 		return nil, errors.Wrap(err, "error validating x5c certificate chain and key")
 	}
@@ -151,7 +160,7 @@ func newX5CSigner(certFile, keyFile, password string) (jose.Signer, error) {
 	so := new(jose.SignerOptions)
 	so.WithType("JWT")
 	so.WithHeader("kid", kid)
-	so.WithHeader("x5c", certs)
+	so.WithHeader("x5c", certStrs)
 	return newJoseSigner(signer, so)
 }
 

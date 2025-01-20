@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,6 +23,7 @@ import (
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/certificates/cas/apiv1"
+	"github.com/stretchr/testify/require"
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/pemutil"
 	"go.step.sm/crypto/randutil"
@@ -91,7 +91,7 @@ func mustSerializeCrt(filename string, certs ...*x509.Certificate) {
 			panic(err)
 		}
 	}
-	if err := ioutil.WriteFile(filename, buf.Bytes(), 0600); err != nil {
+	if err := os.WriteFile(filename, buf.Bytes(), 0600); err != nil {
 		panic(err)
 	}
 }
@@ -105,7 +105,7 @@ func mustSerializeKey(filename string, key crypto.Signer) {
 		Type:  "PRIVATE KEY",
 		Bytes: b,
 	})
-	if err := ioutil.WriteFile(filename, b, 0600); err != nil {
+	if err := os.WriteFile(filename, b, 0600); err != nil {
 		panic(err)
 	}
 }
@@ -140,6 +140,16 @@ func testCAHelper(t *testing.T) (*url.URL, *ca.Client) {
 			var msg api.SignRequest
 			parseJSON(r, &msg)
 			if msg.CsrPEM.DNSNames[0] == "fail.doe.org" {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, `{"error":"fail","message":"fail"}`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			writeJSON(w, api.SignResponse{
+				CertChainPEM: []api.Certificate{api.NewCertificate(testCrt), api.NewCertificate(testIssCrt)},
+			})
+		case r.RequestURI == "/renew":
+			if r.Header.Get("Authorization") == "Bearer fail" {
 				w.WriteHeader(http.StatusBadRequest)
 				fmt.Fprintf(w, `{"error":"fail","message":"fail"}`)
 				return
@@ -236,7 +246,7 @@ func testJWKIssuer(t *testing.T, caURL *url.URL, password string) *jwkIssuer {
 		key = testEncryptedKeyPath
 		password = testPassword
 	}
-	jwk, err := newJWKIssuer(caURL, client, &apiv1.CertificateIssuer{
+	jwk, err := newJWKIssuer(context.TODO(), caURL, client, &apiv1.CertificateIssuer{
 		Type:        "jwk",
 		Provisioner: "ra@doe.org",
 		Key:         key,
@@ -291,7 +301,7 @@ func TestMain(m *testing.M) {
 	}
 
 	// Create test files.
-	path, err := ioutil.TempDir(os.TempDir(), "stepcas")
+	path, err := os.MkdirTemp(os.TempDir(), "stepcas")
 	if err != nil {
 		panic(err)
 	}
@@ -408,6 +418,19 @@ func TestNew(t *testing.T) {
 				issuer: "ra@doe.org",
 				signer: signer,
 			},
+			client:      client,
+			fingerprint: testRootFingerprint,
+		}, false},
+		{"ok ca getter", args{context.TODO(), apiv1.Options{
+			IsCAGetter:                      true,
+			CertificateAuthority:            caURL.String(),
+			CertificateAuthorityFingerprint: testRootFingerprint,
+			CertificateIssuer: &apiv1.CertificateIssuer{
+				Type:        "jwk",
+				Provisioner: "ra@doe.org",
+			},
+		}}, &StepCAS{
+			iss:         nil,
 			client:      client,
 			fingerprint: testRootFingerprint,
 		}, false},
@@ -601,6 +624,23 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestStepCAS_Type(t *testing.T) {
+	tests := []struct {
+		name string
+		want apiv1.Type
+	}{
+		{"ok", apiv1.StepCAS},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &StepCAS{}
+			if got := c.Type(); got != tt.want {
+				t.Errorf("StepCAS.Type() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStepCAS_CreateCertificate(t *testing.T) {
 	caURL, client := testCAHelper(t)
 	x5c := testX5CIssuer(t, caURL, "")
@@ -608,6 +648,17 @@ func TestStepCAS_CreateCertificate(t *testing.T) {
 	x5cEnc := testX5CIssuer(t, caURL, testPassword)
 	jwkEnc := testJWKIssuer(t, caURL, testPassword)
 	x5cBad := testX5CIssuer(t, caURL, "bad-password")
+
+	testTemplate := &x509.Certificate{
+		Subject:        testCR.Subject,
+		DNSNames:       testCR.DNSNames,
+		EmailAddresses: testCR.EmailAddresses,
+		IPAddresses:    testCR.IPAddresses,
+		URIs:           testCR.URIs,
+	}
+
+	testOtherCR, err := x509util.CreateCertificateRequest("Test Certificate", []string{"test.example.com"}, testKey)
+	require.NoError(t, err)
 
 	type fields struct {
 		iss         stepIssuer
@@ -626,6 +677,15 @@ func TestStepCAS_CreateCertificate(t *testing.T) {
 	}{
 		{"ok", fields{x5c, client, testRootFingerprint}, args{&apiv1.CreateCertificateRequest{
 			CSR:      testCR,
+			Template: testTemplate,
+			Lifetime: time.Hour,
+		}}, &apiv1.CreateCertificateResponse{
+			Certificate:      testCrt,
+			CertificateChain: []*x509.Certificate{testIssCrt},
+		}, false},
+		{"ok with different CSR", fields{x5c, client, testRootFingerprint}, args{&apiv1.CreateCertificateRequest{
+			CSR:      testOtherCR,
+			Template: testTemplate,
 			Lifetime: time.Hour,
 		}}, &apiv1.CreateCertificateResponse{
 			Certificate:      testCrt,
@@ -633,6 +693,7 @@ func TestStepCAS_CreateCertificate(t *testing.T) {
 		}, false},
 		{"ok with password", fields{x5cEnc, client, testRootFingerprint}, args{&apiv1.CreateCertificateRequest{
 			CSR:      testCR,
+			Template: testTemplate,
 			Lifetime: time.Hour,
 		}}, &apiv1.CreateCertificateResponse{
 			Certificate:      testCrt,
@@ -640,6 +701,7 @@ func TestStepCAS_CreateCertificate(t *testing.T) {
 		}, false},
 		{"ok jwk", fields{jwk, client, testRootFingerprint}, args{&apiv1.CreateCertificateRequest{
 			CSR:      testCR,
+			Template: testTemplate,
 			Lifetime: time.Hour,
 		}}, &apiv1.CreateCertificateResponse{
 			Certificate:      testCrt,
@@ -647,13 +709,38 @@ func TestStepCAS_CreateCertificate(t *testing.T) {
 		}, false},
 		{"ok jwk with password", fields{jwkEnc, client, testRootFingerprint}, args{&apiv1.CreateCertificateRequest{
 			CSR:      testCR,
+			Template: testTemplate,
 			Lifetime: time.Hour,
+		}}, &apiv1.CreateCertificateResponse{
+			Certificate:      testCrt,
+			CertificateChain: []*x509.Certificate{testIssCrt},
+		}, false},
+		{"ok with provisioner", fields{jwk, client, testRootFingerprint}, args{&apiv1.CreateCertificateRequest{
+			CSR:         testCR,
+			Template:    testTemplate,
+			Lifetime:    time.Hour,
+			Provisioner: &apiv1.ProvisionerInfo{ID: "provisioner-id", Type: "ACME"},
+		}}, &apiv1.CreateCertificateResponse{
+			Certificate:      testCrt,
+			CertificateChain: []*x509.Certificate{testIssCrt},
+		}, false},
+		{"ok with server cert", fields{jwk, client, testRootFingerprint}, args{&apiv1.CreateCertificateRequest{
+			CSR:            testCR,
+			Template:       testTemplate,
+			Lifetime:       time.Hour,
+			IsCAServerCert: true,
 		}}, &apiv1.CreateCertificateResponse{
 			Certificate:      testCrt,
 			CertificateChain: []*x509.Certificate{testIssCrt},
 		}, false},
 		{"fail CSR", fields{x5c, client, testRootFingerprint}, args{&apiv1.CreateCertificateRequest{
 			CSR:      nil,
+			Template: testTemplate,
+			Lifetime: time.Hour,
+		}}, nil, true},
+		{"fail Template", fields{x5c, client, testRootFingerprint}, args{&apiv1.CreateCertificateRequest{
+			CSR:      testCR,
+			Template: nil,
 			Lifetime: time.Hour,
 		}}, nil, true},
 		{"fail lifetime", fields{x5c, client, testRootFingerprint}, args{&apiv1.CreateCertificateRequest{
@@ -678,6 +765,7 @@ func TestStepCAS_CreateCertificate(t *testing.T) {
 			s := &StepCAS{
 				iss:         tt.fields.iss,
 				client:      tt.fields.client,
+				authorityID: "authority-id",
 				fingerprint: tt.fields.fingerprint,
 			}
 			got, err := s.CreateCertificate(tt.args.req)
@@ -694,8 +782,13 @@ func TestStepCAS_CreateCertificate(t *testing.T) {
 
 func TestStepCAS_RenewCertificate(t *testing.T) {
 	caURL, client := testCAHelper(t)
-	x5c := testX5CIssuer(t, caURL, "")
 	jwk := testJWKIssuer(t, caURL, "")
+
+	tokenIssuer := testX5CIssuer(t, caURL, "")
+	token, err := tokenIssuer.SignToken("test", []string{"test.example.com"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	type fields struct {
 		iss         stepIssuer
@@ -712,13 +805,25 @@ func TestStepCAS_RenewCertificate(t *testing.T) {
 		want    *apiv1.RenewCertificateResponse
 		wantErr bool
 	}{
-		{"not implemented", fields{x5c, client, testRootFingerprint}, args{&apiv1.RenewCertificateRequest{
-			CSR:      testCR,
+		{"ok", fields{jwk, client, testRootFingerprint}, args{&apiv1.RenewCertificateRequest{
+			Template: &x509.Certificate{},
+			Backdate: time.Minute,
+			Lifetime: time.Hour,
+			Token:    token,
+		}}, &apiv1.RenewCertificateResponse{
+			Certificate:      testCrt,
+			CertificateChain: []*x509.Certificate{testIssCrt},
+		}, false},
+		{"fail no token", fields{jwk, client, testRootFingerprint}, args{&apiv1.RenewCertificateRequest{
+			Template: &x509.Certificate{},
+			Backdate: time.Minute,
 			Lifetime: time.Hour,
 		}}, nil, true},
-		{"not implemented jwk", fields{jwk, client, testRootFingerprint}, args{&apiv1.RenewCertificateRequest{
-			CSR:      testCR,
+		{"fail bad token", fields{jwk, client, testRootFingerprint}, args{&apiv1.RenewCertificateRequest{
+			Template: &x509.Certificate{},
+			Backdate: time.Minute,
 			Lifetime: time.Hour,
+			Token:    "fail",
 		}}, nil, true},
 	}
 	for _, tt := range tests {
@@ -734,7 +839,10 @@ func TestStepCAS_RenewCertificate(t *testing.T) {
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("StepCAS.RenewCertificate() = %v, want %v", got, tt.want)
+				t.Error(reflect.DeepEqual(got.Certificate, tt.want.Certificate))
+				t.Error(reflect.DeepEqual(got.CertificateChain, tt.want.CertificateChain))
+
+				t.Errorf("StepCAS.RenewCertificate() = %v, want %v", got.Certificate.Subject, tt.want.Certificate.Subject)
 			}
 		})
 	}

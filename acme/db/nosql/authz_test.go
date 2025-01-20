@@ -3,9 +3,11 @@ package nosql
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/acme"
@@ -75,7 +77,7 @@ func TestDB_getDBAuthz(t *testing.T) {
 				Token:        "token",
 				CreatedAt:    now,
 				ExpiresAt:    now.Add(5 * time.Minute),
-				Error:        acme.NewErrorISE("force"),
+				Error:        acme.NewErrorISE("The server experienced an internal error"),
 				ChallengeIDs: []string{"foo", "bar"},
 				Wildcard:     true,
 			}
@@ -97,34 +99,32 @@ func TestDB_getDBAuthz(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
-			if dbaz, err := db.getDBAuthz(context.Background(), azID); err != nil {
-				switch k := err.(type) {
-				case *acme.Error:
+			d := DB{db: tc.db}
+			if dbaz, err := d.getDBAuthz(context.Background(), azID); err != nil {
+				var acmeErr *acme.Error
+				if errors.As(err, &acmeErr) {
 					if assert.NotNil(t, tc.acmeErr) {
-						assert.Equals(t, k.Type, tc.acmeErr.Type)
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
-						assert.Equals(t, k.Status, tc.acmeErr.Status)
-						assert.Equals(t, k.Err.Error(), tc.acmeErr.Err.Error())
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, acmeErr.Type, tc.acmeErr.Type)
+						assert.Equals(t, acmeErr.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, acmeErr.Status, tc.acmeErr.Status)
+						assert.Equals(t, acmeErr.Err.Error(), tc.acmeErr.Err.Error())
+						assert.Equals(t, acmeErr.Detail, tc.acmeErr.Detail)
 					}
-				default:
+				} else {
 					if assert.NotNil(t, tc.err) {
 						assert.HasPrefix(t, err.Error(), tc.err.Error())
 					}
 				}
-			} else {
-				if assert.Nil(t, tc.err) {
-					assert.Equals(t, dbaz.ID, tc.dbaz.ID)
-					assert.Equals(t, dbaz.AccountID, tc.dbaz.AccountID)
-					assert.Equals(t, dbaz.Identifier, tc.dbaz.Identifier)
-					assert.Equals(t, dbaz.Status, tc.dbaz.Status)
-					assert.Equals(t, dbaz.Token, tc.dbaz.Token)
-					assert.Equals(t, dbaz.CreatedAt, tc.dbaz.CreatedAt)
-					assert.Equals(t, dbaz.ExpiresAt, tc.dbaz.ExpiresAt)
-					assert.Equals(t, dbaz.Error.Error(), tc.dbaz.Error.Error())
-					assert.Equals(t, dbaz.Wildcard, tc.dbaz.Wildcard)
-				}
+			} else if assert.Nil(t, tc.err) {
+				assert.Equals(t, dbaz.ID, tc.dbaz.ID)
+				assert.Equals(t, dbaz.AccountID, tc.dbaz.AccountID)
+				assert.Equals(t, dbaz.Identifier, tc.dbaz.Identifier)
+				assert.Equals(t, dbaz.Status, tc.dbaz.Status)
+				assert.Equals(t, dbaz.Token, tc.dbaz.Token)
+				assert.Equals(t, dbaz.CreatedAt, tc.dbaz.CreatedAt)
+				assert.Equals(t, dbaz.ExpiresAt, tc.dbaz.ExpiresAt)
+				assert.Equals(t, dbaz.Error.Error(), tc.dbaz.Error.Error())
+				assert.Equals(t, dbaz.Wildcard, tc.dbaz.Wildcard)
 			}
 		})
 	}
@@ -254,7 +254,7 @@ func TestDB_GetAuthorization(t *testing.T) {
 				Token:        "token",
 				CreatedAt:    now,
 				ExpiresAt:    now.Add(5 * time.Minute),
-				Error:        acme.NewErrorISE("force"),
+				Error:        acme.NewErrorISE("The server experienced an internal error"),
 				ChallengeIDs: []string{"foo", "bar"},
 				Wildcard:     true,
 			}
@@ -293,37 +293,35 @@ func TestDB_GetAuthorization(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
-			if az, err := db.GetAuthorization(context.Background(), azID); err != nil {
-				switch k := err.(type) {
-				case *acme.Error:
+			d := DB{db: tc.db}
+			if az, err := d.GetAuthorization(context.Background(), azID); err != nil {
+				var acmeErr *acme.Error
+				if errors.As(err, &acmeErr) {
 					if assert.NotNil(t, tc.acmeErr) {
-						assert.Equals(t, k.Type, tc.acmeErr.Type)
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
-						assert.Equals(t, k.Status, tc.acmeErr.Status)
-						assert.Equals(t, k.Err.Error(), tc.acmeErr.Err.Error())
-						assert.Equals(t, k.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, acmeErr.Type, tc.acmeErr.Type)
+						assert.Equals(t, acmeErr.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, acmeErr.Status, tc.acmeErr.Status)
+						assert.Equals(t, acmeErr.Err.Error(), tc.acmeErr.Err.Error())
+						assert.Equals(t, acmeErr.Detail, tc.acmeErr.Detail)
 					}
-				default:
+				} else {
 					if assert.NotNil(t, tc.err) {
 						assert.HasPrefix(t, err.Error(), tc.err.Error())
 					}
 				}
-			} else {
-				if assert.Nil(t, tc.err) {
-					assert.Equals(t, az.ID, tc.dbaz.ID)
-					assert.Equals(t, az.AccountID, tc.dbaz.AccountID)
-					assert.Equals(t, az.Identifier, tc.dbaz.Identifier)
-					assert.Equals(t, az.Status, tc.dbaz.Status)
-					assert.Equals(t, az.Token, tc.dbaz.Token)
-					assert.Equals(t, az.Wildcard, tc.dbaz.Wildcard)
-					assert.Equals(t, az.ExpiresAt, tc.dbaz.ExpiresAt)
-					assert.Equals(t, az.Challenges, []*acme.Challenge{
-						{ID: "foo"},
-						{ID: "bar"},
-					})
-					assert.Equals(t, az.Error.Error(), tc.dbaz.Error.Error())
-				}
+			} else if assert.Nil(t, tc.err) {
+				assert.Equals(t, az.ID, tc.dbaz.ID)
+				assert.Equals(t, az.AccountID, tc.dbaz.AccountID)
+				assert.Equals(t, az.Identifier, tc.dbaz.Identifier)
+				assert.Equals(t, az.Status, tc.dbaz.Status)
+				assert.Equals(t, az.Token, tc.dbaz.Token)
+				assert.Equals(t, az.Wildcard, tc.dbaz.Wildcard)
+				assert.Equals(t, az.ExpiresAt, tc.dbaz.ExpiresAt)
+				assert.Equals(t, az.Challenges, []*acme.Challenge{
+					{ID: "foo"},
+					{ID: "bar"},
+				})
+				assert.Equals(t, az.Error.Error(), tc.dbaz.Error.Error())
 			}
 		})
 	}
@@ -445,8 +443,8 @@ func TestDB_CreateAuthorization(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
-			if err := db.CreateAuthorization(context.Background(), tc.az); err != nil {
+			d := DB{db: tc.db}
+			if err := d.CreateAuthorization(context.Background(), tc.az); err != nil {
 				if assert.NotNil(t, tc.err) {
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -475,6 +473,7 @@ func TestDB_UpdateAuthorization(t *testing.T) {
 		ExpiresAt:    now.Add(5 * time.Minute),
 		ChallengeIDs: []string{"foo", "bar"},
 		Wildcard:     true,
+		Fingerprint:  "fingerprint",
 	}
 	b, err := json.Marshal(dbaz)
 	assert.FatalError(t, err)
@@ -534,7 +533,7 @@ func TestDB_UpdateAuthorization(t *testing.T) {
 						assert.Equals(t, dbNew.Wildcard, dbaz.Wildcard)
 						assert.Equals(t, dbNew.CreatedAt, dbaz.CreatedAt)
 						assert.Equals(t, dbNew.ExpiresAt, dbaz.ExpiresAt)
-						assert.Equals(t, dbNew.Error.Error(), acme.NewError(acme.ErrorMalformedType, "malformed").Error())
+						assert.Equals(t, dbNew.Error.Error(), acme.NewError(acme.ErrorMalformedType, "The request message was malformed").Error())
 						return nil, false, errors.New("force")
 					},
 				},
@@ -551,10 +550,11 @@ func TestDB_UpdateAuthorization(t *testing.T) {
 					{ID: "foo"},
 					{ID: "bar"},
 				},
-				Token:     dbaz.Token,
-				Wildcard:  dbaz.Wildcard,
-				ExpiresAt: dbaz.ExpiresAt,
-				Error:     acme.NewError(acme.ErrorMalformedType, "malformed"),
+				Token:       dbaz.Token,
+				Wildcard:    dbaz.Wildcard,
+				ExpiresAt:   dbaz.ExpiresAt,
+				Fingerprint: "fingerprint",
+				Error:       acme.NewError(acme.ErrorMalformedType, "malformed"),
 			}
 			return test{
 				az: updAz,
@@ -584,7 +584,8 @@ func TestDB_UpdateAuthorization(t *testing.T) {
 						assert.Equals(t, dbNew.Wildcard, dbaz.Wildcard)
 						assert.Equals(t, dbNew.CreatedAt, dbaz.CreatedAt)
 						assert.Equals(t, dbNew.ExpiresAt, dbaz.ExpiresAt)
-						assert.Equals(t, dbNew.Error.Error(), acme.NewError(acme.ErrorMalformedType, "malformed").Error())
+						assert.Equals(t, dbNew.Fingerprint, dbaz.Fingerprint)
+						assert.Equals(t, dbNew.Error.Error(), acme.NewError(acme.ErrorMalformedType, "The request message was malformed").Error())
 						return nu, true, nil
 					},
 				},
@@ -594,8 +595,8 @@ func TestDB_UpdateAuthorization(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			db := DB{db: tc.db}
-			if err := db.UpdateAuthorization(context.Background(), tc.az); err != nil {
+			d := DB{db: tc.db}
+			if err := d.UpdateAuthorization(context.Background(), tc.az); err != nil {
 				if assert.NotNil(t, tc.err) {
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -613,6 +614,157 @@ func TestDB_UpdateAuthorization(t *testing.T) {
 						{ID: "bar"},
 					})
 					assert.Equals(t, tc.az.Error.Error(), acme.NewError(acme.ErrorMalformedType, "malformed").Error())
+				}
+			}
+		})
+	}
+}
+
+func TestDB_GetAuthorizationsByAccountID(t *testing.T) {
+	azID := "azID"
+	accountID := "accountID"
+	type test struct {
+		db      nosql.DB
+		err     error
+		acmeErr *acme.Error
+		authzs  []*acme.Authorization
+	}
+	var tests = map[string]func(t *testing.T) test{
+		"fail/db.List-error": func(t *testing.T) test {
+			return test{
+				db: &db.MockNoSQLDB{
+					MList: func(bucket []byte) ([]*nosqldb.Entry, error) {
+						assert.Equals(t, bucket, authzTable)
+						return nil, errors.New("force")
+					},
+				},
+				err: errors.New("error listing authz: force"),
+			}
+		},
+		"fail/unmarshal": func(t *testing.T) test {
+			b := []byte(`{malformed}`)
+			return test{
+				db: &db.MockNoSQLDB{
+					MList: func(bucket []byte) ([]*nosqldb.Entry, error) {
+						assert.Equals(t, bucket, authzTable)
+						return []*nosqldb.Entry{
+							{
+								Bucket: bucket,
+								Key:    []byte(azID),
+								Value:  b,
+							},
+						}, nil
+					},
+				},
+				authzs: nil,
+				err:    fmt.Errorf("error unmarshaling dbAuthz key '%s' into dbAuthz struct", azID),
+			}
+		},
+		"ok": func(t *testing.T) test {
+			now := clock.Now()
+			dbaz := &dbAuthz{
+				ID:        azID,
+				AccountID: accountID,
+				Identifier: acme.Identifier{
+					Type:  "dns",
+					Value: "test.ca.smallstep.com",
+				},
+				Status:       acme.StatusValid,
+				Token:        "token",
+				CreatedAt:    now,
+				ExpiresAt:    now.Add(5 * time.Minute),
+				ChallengeIDs: []string{"foo", "bar"},
+				Wildcard:     true,
+			}
+			b, err := json.Marshal(dbaz)
+			assert.FatalError(t, err)
+
+			return test{
+				db: &db.MockNoSQLDB{
+					MList: func(bucket []byte) ([]*nosqldb.Entry, error) {
+						assert.Equals(t, bucket, authzTable)
+						return []*nosqldb.Entry{
+							{
+								Bucket: bucket,
+								Key:    []byte(azID),
+								Value:  b,
+							},
+						}, nil
+					},
+				},
+				authzs: []*acme.Authorization{
+					{
+						ID:         dbaz.ID,
+						AccountID:  dbaz.AccountID,
+						Token:      dbaz.Token,
+						Identifier: dbaz.Identifier,
+						Status:     dbaz.Status,
+						Challenges: nil,
+						Wildcard:   dbaz.Wildcard,
+						ExpiresAt:  dbaz.ExpiresAt,
+						Error:      dbaz.Error,
+					},
+				},
+			}
+		},
+		"ok/skip-different-account": func(t *testing.T) test {
+			now := clock.Now()
+			dbaz := &dbAuthz{
+				ID:        azID,
+				AccountID: "differentAccountID",
+				Identifier: acme.Identifier{
+					Type:  "dns",
+					Value: "test.ca.smallstep.com",
+				},
+				Status:       acme.StatusValid,
+				Token:        "token",
+				CreatedAt:    now,
+				ExpiresAt:    now.Add(5 * time.Minute),
+				ChallengeIDs: []string{"foo", "bar"},
+				Wildcard:     true,
+			}
+			b, err := json.Marshal(dbaz)
+			assert.FatalError(t, err)
+
+			return test{
+				db: &db.MockNoSQLDB{
+					MList: func(bucket []byte) ([]*nosqldb.Entry, error) {
+						assert.Equals(t, bucket, authzTable)
+						return []*nosqldb.Entry{
+							{
+								Bucket: bucket,
+								Key:    []byte(azID),
+								Value:  b,
+							},
+						}, nil
+					},
+				},
+				authzs: []*acme.Authorization{},
+			}
+		},
+	}
+	for name, run := range tests {
+		tc := run(t)
+		t.Run(name, func(t *testing.T) {
+			d := DB{db: tc.db}
+			if azs, err := d.GetAuthorizationsByAccountID(context.Background(), accountID); err != nil {
+				var acmeErr *acme.Error
+				if errors.As(err, &acmeErr) {
+					if assert.NotNil(t, tc.acmeErr) {
+						assert.Equals(t, acmeErr.Type, tc.acmeErr.Type)
+						assert.Equals(t, acmeErr.Detail, tc.acmeErr.Detail)
+						assert.Equals(t, acmeErr.Status, tc.acmeErr.Status)
+						assert.Equals(t, acmeErr.Err.Error(), tc.acmeErr.Err.Error())
+						assert.Equals(t, acmeErr.Detail, tc.acmeErr.Detail)
+					}
+				} else {
+					if assert.NotNil(t, tc.err) {
+						assert.HasPrefix(t, err.Error(), tc.err.Error())
+					}
+				}
+			} else if assert.Nil(t, tc.err) {
+				if !cmp.Equal(azs, tc.authzs) {
+					t.Errorf("db.GetAuthorizationsByAccountID() diff =\n%s", cmp.Diff(azs, tc.authzs))
 				}
 			}
 		})
