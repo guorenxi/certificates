@@ -7,7 +7,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 
@@ -38,18 +37,23 @@ func NewACMEClient(endpoint string, contact []string, opts ...ClientOption) (*AC
 	if err != nil {
 		return nil, err
 	}
-
 	ac := &ACMEClient{
 		client: &http.Client{
 			Transport: tr,
 		},
 		dirLoc: endpoint,
 	}
-
-	resp, err := ac.client.Get(endpoint)
+	req, err := http.NewRequest("GET", endpoint, http.NoBody)
+	if err != nil {
+		return nil, errors.Wrapf(err, "creating GET request %s failed", endpoint)
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	enforceRequestID(req)
+	resp, err := ac.client.Do(req)
 	if err != nil {
 		return nil, errors.Wrapf(err, "client GET %s failed", endpoint)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return nil, readACMEError(resp.Body)
 	}
@@ -78,6 +82,7 @@ func NewACMEClient(endpoint string, contact []string, opts ...ClientOption) (*AC
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return nil, readACMEError(resp.Body)
 	}
@@ -100,10 +105,17 @@ func (c *ACMEClient) GetDirectory() (*acmeAPI.Directory, error) {
 // GetNonce makes a nonce request to the ACME api and returns an
 // ACME directory object.
 func (c *ACMEClient) GetNonce() (string, error) {
-	resp, err := c.client.Get(c.dir.NewNonce)
+	req, err := http.NewRequest("GET", c.dir.NewNonce, http.NoBody)
+	if err != nil {
+		return "", errors.Wrapf(err, "creating GET request %s failed", c.dir.NewNonce)
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	enforceRequestID(req)
+	resp, err := c.client.Do(req)
 	if err != nil {
 		return "", errors.Wrapf(err, "client GET %s failed", c.dir.NewNonce)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return "", readACMEError(resp.Body)
 	}
@@ -166,15 +178,22 @@ func (c *ACMEClient) post(payload []byte, url string, headerOps ...withHeaderOpt
 	}
 	signed, err := signer.Sign(payload)
 	if err != nil {
-		return nil, errors.Errorf("error signing payload: %s", strings.TrimPrefix(err.Error(), "square/go-jose: "))
+		return nil, errors.Errorf("error signing payload: %s", jose.TrimPrefix(err))
 	}
 	raw, err := serialize(signed)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.client.Post(url, "application/jose+json", strings.NewReader(raw))
+	req, err := http.NewRequest("POST", url, strings.NewReader(raw))
 	if err != nil {
-		return nil, errors.Wrapf(err, "client GET %s failed", c.dir.NewOrder)
+		return nil, errors.Wrapf(err, "creating POST request %s failed", url)
+	}
+	req.Header.Set("Content-Type", "application/jose+json")
+	req.Header.Set("User-Agent", UserAgent)
+	enforceRequestID(req)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, errors.Wrapf(err, "client POST %s failed", c.dir.NewOrder)
 	}
 	return resp, nil
 }
@@ -185,6 +204,7 @@ func (c *ACMEClient) NewOrder(payload []byte) (*acme.Order, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return nil, readACMEError(resp.Body)
 	}
@@ -205,6 +225,7 @@ func (c *ACMEClient) GetChallenge(url string) (*acme.Challenge, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return nil, readACMEError(resp.Body)
 	}
@@ -224,6 +245,21 @@ func (c *ACMEClient) ValidateChallenge(url string) error {
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return readACMEError(resp.Body)
+	}
+	return nil
+}
+
+// ValidateWithPayload will attempt to validate the challenge at the given url
+// with the given attestation payload.
+func (c *ACMEClient) ValidateWithPayload(url string, payload []byte) error {
+	resp, err := c.post(payload, url, withKid(c))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return readACMEError(resp.Body)
 	}
@@ -236,6 +272,7 @@ func (c *ACMEClient) GetAuthz(url string) (*acme.Authorization, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return nil, readACMEError(resp.Body)
 	}
@@ -253,6 +290,7 @@ func (c *ACMEClient) GetOrder(url string) (*acme.Order, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return nil, readACMEError(resp.Body)
 	}
@@ -276,6 +314,7 @@ func (c *ACMEClient) FinalizeOrder(url string, csr *x509.CertificateRequest) err
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return readACMEError(resp.Body)
 	}
@@ -288,11 +327,12 @@ func (c *ACMEClient) GetCertificate(url string) (*x509.Certificate, []*x509.Cert
 	if err != nil {
 		return nil, nil, err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return nil, nil, readACMEError(resp.Body)
 	}
 	defer resp.Body.Close()
-	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "error reading GET certificate response")
 	}
@@ -324,6 +364,7 @@ func (c *ACMEClient) GetAccountOrders() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return nil, readACMEError(resp.Body)
 	}
@@ -338,14 +379,14 @@ func (c *ACMEClient) GetAccountOrders() ([]string, error) {
 
 func readACMEError(r io.ReadCloser) error {
 	defer r.Close()
-	b, err := ioutil.ReadAll(r)
+	b, err := io.ReadAll(r)
 	if err != nil {
 		return errors.Wrap(err, "error reading from body")
 	}
 	ae := new(acme.Error)
 	err = json.Unmarshal(b, &ae)
 	// If we successfully marshaled to an ACMEError then return the ACMEError.
-	if err != nil || len(ae.Error()) == 0 {
+	if err != nil || ae.Error() == "" {
 		fmt.Printf("b = %s\n", b)
 		// Throw up our hands.
 		return errors.Errorf("%s", b)

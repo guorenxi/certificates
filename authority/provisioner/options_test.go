@@ -68,6 +68,36 @@ func TestOptions_GetSSHOptions(t *testing.T) {
 	}
 }
 
+func TestOptions_GetWebhooks(t *testing.T) {
+	type fields struct {
+		o *Options
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		want   []*Webhook
+	}{
+		{"ok", fields{&Options{Webhooks: []*Webhook{
+			{Name: "foo"},
+			{Name: "bar"},
+		}}},
+			[]*Webhook{
+				{Name: "foo"},
+				{Name: "bar"},
+			},
+		},
+		{"nil", fields{&Options{}}, nil},
+		{"nilOptions", fields{nil}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.fields.o.GetWebhooks(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Options.GetWebhooks() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProvisionerX509Options_HasTemplate(t *testing.T) {
 	type fields struct {
 		Template     string
@@ -159,7 +189,7 @@ func TestTemplateOptions(t *testing.T) {
 
 func TestCustomTemplateOptions(t *testing.T) {
 	csr := parseCertificateRequest(t, "testdata/certs/ecdsa.csr")
-	csrCertificate := `{"version":0,"subject":{"commonName":"foo"},"dnsNames":["foo"],"emailAddresses":null,"ipAddresses":null,"uris":null,"sans":null,"extensions":[{"id":"2.5.29.17","critical":false,"value":"MAWCA2Zvbw=="}],"signatureAlgorithm":""}`
+	csrCertificate := `{"version":0,"subject":{"commonName":"foo"},"rawSubject":"MA4xDDAKBgNVBAMTA2Zvbw==","dnsNames":["foo"],"emailAddresses":null,"ipAddresses":null,"uris":null,"sans":null,"extensions":[{"id":"2.5.29.17","critical":false,"value":"MAWCA2Zvbw=="}],"signatureAlgorithm":""}`
 	data := x509util.TemplateData{
 		x509util.SubjectKey: x509util.Subject{
 			CommonName: "foobar",
@@ -254,6 +284,7 @@ func TestCustomTemplateOptions(t *testing.T) {
 }
 
 func Test_unsafeParseSigned(t *testing.T) {
+	//nolint:gosec // no credentials here
 	okToken := "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJqYW5lQGRvZS5jb20iLCJpc3MiOiJodHRwczovL2RvZS5jb20iLCJqdGkiOiI4ZmYzMjQ4MS1mZDVmLTRlMmUtOTZkZi05MDhjMTI3Yzg1ZjciLCJpYXQiOjE1OTUzNjAwMjgsImV4cCI6MTU5NTM2MzYyOH0.aid8UuhFucJOFHXaob9zpNtVvhul9ulTGsA52mU6XIw"
 	type args struct {
 		s string
@@ -283,6 +314,41 @@ func Test_unsafeParseSigned(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("unsafeParseSigned() = \n%v, want \n%v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestX509Options_IsWildcardLiteralAllowed(t *testing.T) {
+	tests := []struct {
+		name    string
+		options *X509Options
+		want    bool
+	}{
+		{
+			name:    "nil-options",
+			options: nil,
+			want:    true,
+		},
+		{
+			name: "set-true",
+			options: &X509Options{
+				AllowWildcardNames: true,
+			},
+			want: true,
+		},
+		{
+			name: "set-false",
+			options: &X509Options{
+				AllowWildcardNames: false,
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.options.AreWildcardNamesAllowed(); got != tt.want {
+				t.Errorf("X509PolicyOptions.IsWildcardLiteralAllowed() = %v, want %v", got, tt.want)
 			}
 		})
 	}

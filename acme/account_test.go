@@ -4,10 +4,12 @@ import (
 	"crypto"
 	"encoding/base64"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/assert"
 	"go.step.sm/crypto/jose"
+
+	"github.com/smallstep/assert"
 )
 
 func TestKeyToID(t *testing.T) {
@@ -23,7 +25,7 @@ func TestKeyToID(t *testing.T) {
 			jwk.Key = "foo"
 			return test{
 				jwk: jwk,
-				err: NewErrorISE("error generating jwk thumbprint: square/go-jose: unknown key type 'string'"),
+				err: NewErrorISE("error generating jwk thumbprint: go-jose/go-jose: unknown key type 'string'"),
 			}
 		},
 		"ok": func(t *testing.T) test {
@@ -44,14 +46,14 @@ func TestKeyToID(t *testing.T) {
 			tc := run(t)
 			if id, err := KeyToID(tc.jwk); err != nil {
 				if assert.NotNil(t, tc.err) {
-					switch k := err.(type) {
-					case *Error:
+					var k *Error
+					if errors.As(err, &k) {
 						assert.Equals(t, k.Type, tc.err.Type)
 						assert.Equals(t, k.Detail, tc.err.Detail)
 						assert.Equals(t, k.Status, tc.err.Status)
 						assert.Equals(t, k.Err.Error(), tc.err.Err.Error())
 						assert.Equals(t, k.Detail, tc.err.Detail)
-					default:
+					} else {
 						assert.FatalError(t, errors.New("unexpected error type"))
 					}
 				}
@@ -60,6 +62,23 @@ func TestKeyToID(t *testing.T) {
 					assert.Equals(t, id, tc.exp)
 				}
 			}
+		})
+	}
+}
+
+func TestAccount_GetLocation(t *testing.T) {
+	locationPrefix := "https://test.ca.smallstep.com/acme/foo/account/"
+	type test struct {
+		acc *Account
+		exp string
+	}
+	tests := map[string]test{
+		"empty":     {acc: &Account{LocationPrefix: ""}, exp: ""},
+		"not-empty": {acc: &Account{ID: "bar", LocationPrefix: locationPrefix}, exp: locationPrefix + "bar"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equals(t, tc.acc.GetLocation(), tc.exp)
 		})
 	}
 }
@@ -76,6 +95,70 @@ func TestAccount_IsValid(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			assert.Equals(t, tc.acc.IsValid(), tc.exp)
+		})
+	}
+}
+
+func TestExternalAccountKey_BindTo(t *testing.T) {
+	boundAt := time.Now()
+	tests := []struct {
+		name string
+		eak  *ExternalAccountKey
+		acct *Account
+		err  *Error
+	}{
+		{
+			name: "ok",
+			eak: &ExternalAccountKey{
+				ID:            "eakID",
+				ProvisionerID: "provID",
+				Reference:     "ref",
+				HmacKey:       []byte{1, 3, 3, 7},
+			},
+			acct: &Account{
+				ID: "accountID",
+			},
+			err: nil,
+		},
+		{
+			name: "fail/already-bound",
+			eak: &ExternalAccountKey{
+				ID:            "eakID",
+				ProvisionerID: "provID",
+				Reference:     "ref",
+				HmacKey:       []byte{1, 3, 3, 7},
+				AccountID:     "someAccountID",
+				BoundAt:       boundAt,
+			},
+			acct: &Account{
+				ID: "accountID",
+			},
+			err: NewError(ErrorUnauthorizedType, "external account binding key with id '%s' was already bound to account '%s' on %s", "eakID", "someAccountID", boundAt),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eak := tt.eak
+			acct := tt.acct
+			err := eak.BindTo(acct)
+			wantErr := tt.err != nil
+			gotErr := err != nil
+			if wantErr != gotErr {
+				t.Errorf("ExternalAccountKey.BindTo() error = %v, wantErr %v", err, tt.err)
+			}
+			if wantErr {
+				assert.NotNil(t, err)
+				var ae *Error
+				if assert.True(t, errors.As(err, &ae)) {
+					assert.Equals(t, ae.Type, tt.err.Type)
+					assert.Equals(t, ae.Detail, tt.err.Detail)
+					assert.Equals(t, ae.Subproblems, tt.err.Subproblems)
+				}
+			} else {
+				assert.Equals(t, eak.AccountID, acct.ID)
+				assert.Equals(t, eak.HmacKey, []byte{})
+				assert.NotNil(t, eak.BoundAt)
+			}
 		})
 	}
 }

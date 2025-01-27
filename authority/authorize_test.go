@@ -3,24 +3,33 @@ package authority
 import (
 	"context"
 	"crypto"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	"github.com/smallstep/assert"
-	"github.com/smallstep/certificates/authority/provisioner"
-	"github.com/smallstep/certificates/db"
-	"github.com/smallstep/certificates/errs"
+	"golang.org/x/crypto/ssh"
+
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/pemutil"
 	"go.step.sm/crypto/randutil"
-	"golang.org/x/crypto/ssh"
+	"go.step.sm/crypto/x509util"
+
+	"github.com/google/uuid"
+	"github.com/smallstep/assert"
+	"github.com/smallstep/certificates/api/render"
+	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/db"
+	"github.com/smallstep/certificates/errs"
 )
 
 var testAudiences = provisioner.Audiences{
@@ -80,6 +89,39 @@ func generateToken(sub, iss, aud string, sans []string, iat time.Time, jwk *jose
 	return jose.Signed(sig).Claims(claims).CompactSerialize()
 }
 
+func generateCustomToken(sub, iss, aud string, jwk *jose.JSONWebKey, extraHeaders, extraClaims map[string]any) (string, error) {
+	so := new(jose.SignerOptions)
+	so.WithType("JWT")
+	so.WithHeader("kid", jwk.KeyID)
+
+	for k, v := range extraHeaders {
+		so.WithHeader(jose.HeaderKey(k), v)
+	}
+
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key}, so)
+	if err != nil {
+		return "", err
+	}
+
+	id, err := randutil.ASCII(64)
+	if err != nil {
+		return "", err
+	}
+
+	iat := time.Now()
+	claims := jose.Claims{
+		ID:        id,
+		Subject:   sub,
+		Issuer:    iss,
+		IssuedAt:  jose.NewNumericDate(iat),
+		NotBefore: jose.NewNumericDate(iat),
+		Expiry:    jose.NewNumericDate(iat.Add(5 * time.Minute)),
+		Audience:  []string{aud},
+	}
+
+	return jose.Signed(sig).Claims(claims).Claims(extraClaims).CompactSerialize()
+}
+
 func TestAuthority_authorizeToken(t *testing.T) {
 	a := testAuthority(t)
 
@@ -106,7 +148,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			return &authorizeTest{
 				auth:  a,
 				token: "foo",
-				err:   errors.New("authority.authorizeToken: error parsing token"),
+				err:   errors.New("error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -125,7 +167,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			return &authorizeTest{
 				auth:  a,
 				token: raw,
-				err:   errors.New("authority.authorizeToken: token issued before the bootstrap of certificate authority"),
+				err:   errors.New("token issued before the bootstrap of certificate authority"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -147,7 +189,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			return &authorizeTest{
 				auth:  a,
 				token: raw,
-				err:   errors.New("authority.authorizeToken: provisioner not found or invalid audience (https://example.com/revoke)"),
+				err:   errors.New("provisioner not found or invalid audience (https://example.com/revoke)"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -184,7 +226,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			return &authorizeTest{
 				auth:  _a,
 				token: raw,
-				err:   errors.New("authority.authorizeToken: token already used"),
+				err:   errors.New("token already used"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -219,7 +261,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			return &authorizeTest{
 				auth:  _a,
 				token: raw,
-				err:   errors.New("authority.authorizeToken: token already used"),
+				err:   errors.New("token already used"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -267,7 +309,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			return &authorizeTest{
 				auth:  _a,
 				token: raw,
-				err:   errors.New("authority.authorizeToken: failed when attempting to store token: force"),
+				err:   errors.New("failed when attempting to store token: force"),
 				code:  http.StatusInternalServerError,
 			}
 		},
@@ -292,7 +334,25 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			return &authorizeTest{
 				auth:  _a,
 				token: raw,
-				err:   errors.New("authority.authorizeToken: token already used"),
+				err:   errors.New("token already used"),
+				code:  http.StatusUnauthorized,
+			}
+		},
+		"fail/uninitialized": func(t *testing.T) *authorizeTest {
+			cl := jose.Claims{
+				Subject:   "test.smallstep.com",
+				Issuer:    "uninitialized",
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
+				Audience:  validAudience,
+				ID:        uuid.NewString(),
+			}
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
+			assert.FatalError(t, err)
+			return &authorizeTest{
+				auth:  a,
+				token: raw,
+				err:   errors.New(`provisioner "uninitialized" is disabled due to an initialization error`),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -305,8 +365,8 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			p, err := tc.auth.authorizeToken(context.Background(), tc.token)
 			if err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -345,7 +405,7 @@ func TestAuthority_authorizeRevoke(t *testing.T) {
 			return &authorizeTest{
 				auth:  a,
 				token: "foo",
-				err:   errors.New("authority.authorizeRevoke: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.authorizeRevoke: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -391,8 +451,8 @@ func TestAuthority_authorizeRevoke(t *testing.T) {
 
 			if err := tc.auth.authorizeRevoke(context.Background(), tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -429,7 +489,7 @@ func TestAuthority_authorizeSign(t *testing.T) {
 			return &authorizeTest{
 				auth:  a,
 				token: "foo",
-				err:   errors.New("authority.authorizeSign: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.authorizeSign: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -476,14 +536,14 @@ func TestAuthority_authorizeSign(t *testing.T) {
 			got, err := tc.auth.authorizeSign(context.Background(), tc.token)
 			if err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
-					assert.Len(t, 7, got)
+					assert.Equals(t, 11, len(got)) // number of provisioner.SignOptions returned
 				}
 			}
 		})
@@ -516,7 +576,7 @@ func TestAuthority_Authorize(t *testing.T) {
 				auth:  a,
 				token: "foo",
 				ctx:   context.Background(),
-				err:   errors.New("authority.Authorize: authority.authorizeSign: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.Authorize: authority.authorizeSign: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -525,7 +585,7 @@ func TestAuthority_Authorize(t *testing.T) {
 				auth:  a,
 				token: "foo",
 				ctx:   provisioner.NewContextWithMethod(context.Background(), provisioner.SignMethod),
-				err:   errors.New("authority.Authorize: authority.authorizeSign: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.Authorize: authority.authorizeSign: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -551,7 +611,7 @@ func TestAuthority_Authorize(t *testing.T) {
 				auth:  a,
 				token: "foo",
 				ctx:   provisioner.NewContextWithMethod(context.Background(), provisioner.RevokeMethod),
-				err:   errors.New("authority.Authorize: authority.authorizeRevoke: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.Authorize: authority.authorizeRevoke: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -577,7 +637,7 @@ func TestAuthority_Authorize(t *testing.T) {
 				auth:  a,
 				token: "foo",
 				ctx:   provisioner.NewContextWithMethod(context.Background(), provisioner.SSHSignMethod),
-				err:   errors.New("authority.Authorize: authority.authorizeSSHSign: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.Authorize: authority.authorizeSSHSign: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -607,7 +667,7 @@ func TestAuthority_Authorize(t *testing.T) {
 				auth:  a,
 				token: "foo",
 				ctx:   provisioner.NewContextWithMethod(context.Background(), provisioner.SSHRenewMethod),
-				err:   errors.New("authority.Authorize: authority.authorizeSSHRenew: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.Authorize: authority.authorizeSSHRenew: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -651,7 +711,7 @@ func TestAuthority_Authorize(t *testing.T) {
 				auth:  a,
 				token: "foo",
 				ctx:   provisioner.NewContextWithMethod(context.Background(), provisioner.SSHRevokeMethod),
-				err:   errors.New("authority.Authorize: authority.authorizeSSHRevoke: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.Authorize: authority.authorizeSSHRevoke: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -677,7 +737,7 @@ func TestAuthority_Authorize(t *testing.T) {
 				auth:  a,
 				token: "foo",
 				ctx:   provisioner.NewContextWithMethod(context.Background(), provisioner.SSHRekeyMethod),
-				err:   errors.New("authority.Authorize: authority.authorizeSSHRekey: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.Authorize: authority.authorizeSSHRekey: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -735,13 +795,13 @@ func TestAuthority_Authorize(t *testing.T) {
 			if err != nil {
 				if assert.NotNil(t, tc.err, fmt.Sprintf("unexpected error: %s", err)) {
 					assert.Nil(t, got)
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 
-					ctxErr, ok := err.(*errs.Error)
-					assert.Fatal(t, ok, "error is not of type *errs.Error")
+					var ctxErr *errs.Error
+					assert.Fatal(t, errors.As(err, &ctxErr), "error is not of type *errs.Error")
 					assert.Equals(t, ctxErr.Details["token"], tc.token)
 				}
 			} else {
@@ -753,6 +813,7 @@ func TestAuthority_Authorize(t *testing.T) {
 
 func TestAuthority_authorizeRenew(t *testing.T) {
 	fooCrt, err := pemutil.ReadCertificate("testdata/certs/foo.crt")
+	fooCrt.NotAfter = time.Now().Add(time.Hour)
 	assert.FatalError(t, err)
 
 	renewDisabledCrt, err := pemutil.ReadCertificate("testdata/certs/renew-disabled.crt")
@@ -822,7 +883,7 @@ func TestAuthority_authorizeRenew(t *testing.T) {
 			return &authorizeTest{
 				auth: a,
 				cert: renewDisabledCrt,
-				err:  errors.New("authority.authorizeRenew: jwk.AuthorizeRenew; renew is disabled for jwk provisioner renew_disabled:IMi94WBNI6gP5cNHXlZYNUzvMjGdHyBRmFoo-lCEaqk"),
+				err:  errors.New("authority.authorizeRenew: renew is disabled for provisioner 'renew_disabled'"),
 				code: http.StatusUnauthorized,
 			}
 		},
@@ -838,22 +899,45 @@ func TestAuthority_authorizeRenew(t *testing.T) {
 				cert: fooCrt,
 			}
 		},
+		"ok/from db": func(t *testing.T) *authorizeTest {
+			a := testAuthority(t)
+			a.db = &db.MockAuthDB{
+				MIsRevoked: func(key string) (bool, error) {
+					return false, nil
+				},
+				MGetCertificateData: func(serialNumber string) (*db.CertificateData, error) {
+					p, ok := a.provisioners.LoadByName("step-cli")
+					if !ok {
+						t.Fatal("provisioner step-cli not found")
+					}
+					return &db.CertificateData{
+						Provisioner: &db.ProvisionerData{
+							ID: p.GetID(),
+						},
+					}, nil
+				},
+			}
+			return &authorizeTest{
+				auth: a,
+				cert: fooCrt,
+			}
+		},
 	}
 
 	for name, genTestCase := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := genTestCase(t)
 
-			err := tc.auth.authorizeRenew(tc.cert)
+			_, err := tc.auth.authorizeRenew(context.Background(), tc.cert)
 			if err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 
-					ctxErr, ok := err.(*errs.Error)
-					assert.Fatal(t, ok, "error is not of type *errs.Error")
+					var ctxErr *errs.Error
+					assert.Fatal(t, errors.As(err, &ctxErr), "error is not of type *errs.Error")
 					assert.Equals(t, ctxErr.Details["serialNumber"], tc.cert.SerialNumber.String())
 				}
 			} else {
@@ -909,6 +993,7 @@ func generateSSHToken(sub, iss, aud string, iat time.Time, sshOpts *provisioner.
 }
 
 func createSSHCert(cert *ssh.Certificate, signer ssh.Signer) (*ssh.Certificate, *jose.JSONWebKey, error) {
+	now := time.Now()
 	jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "foo", 0)
 	if err != nil {
 		return nil, nil, err
@@ -917,7 +1002,13 @@ func createSSHCert(cert *ssh.Certificate, signer ssh.Signer) (*ssh.Certificate, 
 	if err != nil {
 		return nil, nil, err
 	}
-	if err = cert.SignCert(rand.Reader, signer); err != nil {
+	if cert.ValidAfter == 0 {
+		cert.ValidAfter = uint64(now.Unix())
+	}
+	if cert.ValidBefore == 0 {
+		cert.ValidBefore = uint64(now.Add(time.Hour).Unix())
+	}
+	if err := cert.SignCert(rand.Reader, signer); err != nil {
 		return nil, nil, err
 	}
 	return cert, jwk, nil
@@ -949,7 +1040,7 @@ func TestAuthority_authorizeSSHSign(t *testing.T) {
 			return &authorizeTest{
 				auth:  a,
 				token: "foo",
-				err:   errors.New("authority.authorizeSSHSign: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.authorizeSSHSign: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -988,14 +1079,14 @@ func TestAuthority_authorizeSSHSign(t *testing.T) {
 			got, err := tc.auth.authorizeSSHSign(context.Background(), tc.token)
 			if err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
-					assert.Len(t, 7, got)
+					assert.Len(t, 10, got) // number of provisioner.SignOptions returned
 				}
 			}
 		})
@@ -1003,6 +1094,23 @@ func TestAuthority_authorizeSSHSign(t *testing.T) {
 }
 
 func TestAuthority_authorizeSSHRenew(t *testing.T) {
+	now := time.Now().UTC()
+	sshpop := func(a *Authority) (*ssh.Certificate, string) {
+		p, ok := a.provisioners.Load("sshpop/sshpop")
+		assert.Fatal(t, ok, "sshpop provisioner not found in test authority")
+		key, err := pemutil.Read("./testdata/secrets/ssh_host_ca_key")
+		assert.FatalError(t, err)
+		signer, ok := key.(crypto.Signer)
+		assert.Fatal(t, ok, "could not cast ssh signing key to crypto signer")
+		sshSigner, err := ssh.NewSignerFromSigner(signer)
+		assert.FatalError(t, err)
+		cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.HostCert}, sshSigner)
+		assert.FatalError(t, err)
+		token, err := generateToken("foo", p.GetName(), testAudiences.SSHRenew[0]+"#sshpop/sshpop", []string{"foo.smallstep.com"}, now, jwk, withSSHPOPFile(cert))
+		assert.FatalError(t, err)
+		return cert, token
+	}
+
 	a := testAuthority(t)
 
 	jwk, err := jose.ReadKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
@@ -1011,8 +1119,6 @@ func TestAuthority_authorizeSSHRenew(t *testing.T) {
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", jwk.KeyID))
 	assert.FatalError(t, err)
-
-	now := time.Now().UTC()
 
 	validIssuer := "step-cli"
 
@@ -1028,7 +1134,7 @@ func TestAuthority_authorizeSSHRenew(t *testing.T) {
 			return &authorizeTest{
 				auth:  a,
 				token: "foo",
-				err:   errors.New("authority.authorizeSSHRenew: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.authorizeSSHRenew: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -1050,27 +1156,34 @@ func TestAuthority_authorizeSSHRenew(t *testing.T) {
 				code:  http.StatusUnauthorized,
 			}
 		},
+		"fail/WithAuthorizeSSHRenewFunc": func(t *testing.T) *authorizeTest {
+			aa := testAuthority(t, WithAuthorizeSSHRenewFunc(func(ctx context.Context, p *provisioner.Controller, cert *ssh.Certificate) error {
+				return errs.Forbidden("forbidden")
+			}))
+			_, token := sshpop(aa)
+			return &authorizeTest{
+				auth:  aa,
+				token: token,
+				err:   errors.New("authority.authorizeSSHRenew: forbidden"),
+				code:  http.StatusForbidden,
+			}
+		},
 		"ok": func(t *testing.T) *authorizeTest {
-			key, err := pemutil.Read("./testdata/secrets/ssh_host_ca_key")
-			assert.FatalError(t, err)
-			signer, ok := key.(crypto.Signer)
-			assert.Fatal(t, ok, "could not cast ssh signing key to crypto signer")
-			sshSigner, err := ssh.NewSignerFromSigner(signer)
-			assert.FatalError(t, err)
-
-			cert, _jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.HostCert}, sshSigner)
-			assert.FatalError(t, err)
-
-			p, ok := a.provisioners.Load("sshpop/sshpop")
-			assert.Fatal(t, ok, "sshpop provisioner not found in test authority")
-
-			tok, err := generateToken("foo", p.GetName(), testAudiences.SSHRenew[0]+"#sshpop/sshpop",
-				[]string{"foo.smallstep.com"}, now, _jwk, withSSHPOPFile(cert))
-			assert.FatalError(t, err)
-
+			cert, token := sshpop(a)
 			return &authorizeTest{
 				auth:  a,
-				token: tok,
+				token: token,
+				cert:  cert,
+			}
+		},
+		"ok/WithAuthorizeSSHRenewFunc": func(t *testing.T) *authorizeTest {
+			aa := testAuthority(t, WithAuthorizeSSHRenewFunc(func(ctx context.Context, p *provisioner.Controller, cert *ssh.Certificate) error {
+				return nil
+			}))
+			cert, token := sshpop(aa)
+			return &authorizeTest{
+				auth:  aa,
+				token: token,
 				cert:  cert,
 			}
 		},
@@ -1083,8 +1196,8 @@ func TestAuthority_authorizeSSHRenew(t *testing.T) {
 			got, err := tc.auth.authorizeSSHRenew(context.Background(), tc.token)
 			if err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -1129,7 +1242,7 @@ func TestAuthority_authorizeSSHRevoke(t *testing.T) {
 			return &authorizeTest{
 				auth:  a,
 				token: "foo",
-				err:   errors.New("authority.authorizeSSHRevoke: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.authorizeSSHRevoke: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -1183,8 +1296,8 @@ func TestAuthority_authorizeSSHRevoke(t *testing.T) {
 
 			if err := tc.auth.authorizeSSHRevoke(context.Background(), tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -1221,7 +1334,7 @@ func TestAuthority_authorizeSSHRekey(t *testing.T) {
 			return &authorizeTest{
 				auth:  a,
 				token: "foo",
-				err:   errors.New("authority.authorizeSSHRekey: authority.authorizeToken: error parsing token"),
+				err:   errors.New("authority.authorizeSSHRekey: error parsing token"),
 				code:  http.StatusUnauthorized,
 			}
 		},
@@ -1276,16 +1389,348 @@ func TestAuthority_authorizeSSHRekey(t *testing.T) {
 			cert, signOpts, err := tc.auth.authorizeSSHRekey(context.Background(), tc.token)
 			if err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
 					assert.Equals(t, tc.cert.Serial, cert.Serial)
-					assert.Len(t, 3, signOpts)
+					assert.Len(t, 4, signOpts)
 				}
+			}
+		})
+	}
+}
+
+func TestAuthority_AuthorizeRenewToken(t *testing.T) {
+	ctx := context.Background()
+	type stepProvisionerASN1 struct {
+		Type          int
+		Name          []byte
+		CredentialID  []byte
+		KeyValuePairs []string `asn1:"optional,omitempty"`
+	}
+
+	_, signer, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csr, err := x509util.CreateCertificateRequest("test.example.com", []string{"test.example.com"}, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherSigner, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	generateX5cToken := func(a *Authority, key crypto.Signer, claims jose.Claims, opts ...provisioner.SignOption) (string, *x509.Certificate) {
+		chain, err := a.SignWithContext(ctx, csr, provisioner.SignOptions{}, opts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var x5c []string
+		for _, c := range chain {
+			x5c = append(x5c, base64.StdEncoding.EncodeToString(c.Raw))
+		}
+
+		so := new(jose.SignerOptions)
+		so.WithType("JWT")
+		so.WithHeader("x5cInsecure", x5c)
+		sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.EdDSA, Key: key}, so)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := jose.Signed(sig).Claims(claims).CompactSerialize()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s, chain[0]
+	}
+
+	now := time.Now()
+	a1 := testAuthority(t)
+	t1, c1 := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/renew"},
+		Subject:   "test.example.com",
+		Issuer:    "step-ca-client/1.0",
+		NotBefore: jose.NewNumericDate(now),
+		Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("step-cli"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	t2, c2 := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/renew"},
+		Subject:   "test.example.com",
+		Issuer:    "step-ca-client/1.0",
+		NotBefore: jose.NewNumericDate(now),
+		Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
+		IssuedAt:  jose.NewNumericDate(now),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now.Add(-time.Hour)
+		cert.NotAfter = now.Add(-time.Minute)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("step-cli"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	t3, c3 := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/renew"},
+		Subject:   "test.example.com",
+		Issuer:    "step-cli",
+		NotBefore: jose.NewNumericDate(now),
+		Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("step-cli"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	a4 := testAuthority(t)
+	a4.db = &db.MockAuthDB{
+		MUseToken: func(id, tok string) (bool, error) {
+			return true, nil
+		},
+		MGetCertificateData: func(serialNumber string) (*db.CertificateData, error) {
+			return &db.CertificateData{
+				Provisioner: &db.ProvisionerData{ID: "Max:IMi94WBNI6gP5cNHXlZYNUzvMjGdHyBRmFoo-lCEaqk", Name: "Max"},
+				RaInfo:      &provisioner.RAInfo{ProvisionerName: "ra"},
+			}, nil
+		},
+	}
+	t4, c4 := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://ra.example.com/1.0/renew"},
+		Subject:   "test.example.com",
+		Issuer:    "step-ca-client/1.0",
+		NotBefore: jose.NewNumericDate(now),
+		Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("step-cli"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	badSigner, _ := generateX5cToken(a1, otherSigner, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/renew"},
+		Subject:   "test.example.com",
+		Issuer:    "step-ca-client/1.0",
+		NotBefore: jose.NewNumericDate(now),
+		Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("foobar"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	badProvisioner, _ := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/renew"},
+		Subject:   "test.example.com",
+		Issuer:    "step-ca-client/1.0",
+		NotBefore: jose.NewNumericDate(now),
+		Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("foobar"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	badIssuer, _ := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/renew"},
+		Subject:   "test.example.com",
+		Issuer:    "bad-issuer",
+		NotBefore: jose.NewNumericDate(now),
+		Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("step-cli"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	badSubject, _ := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/renew"},
+		Subject:   "bad-subject",
+		Issuer:    "step-ca-client/1.0",
+		NotBefore: jose.NewNumericDate(now),
+		Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("step-cli"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	badNotBefore, _ := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/sign"},
+		Subject:   "test.example.com",
+		Issuer:    "step-ca-client/1.0",
+		NotBefore: jose.NewNumericDate(now.Add(5 * time.Minute)),
+		Expiry:    jose.NewNumericDate(now.Add(10 * time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("step-cli"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	badExpiry, _ := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/sign"},
+		Subject:   "test.example.com",
+		Issuer:    "step-ca-client/1.0",
+		NotBefore: jose.NewNumericDate(now.Add(-5 * time.Minute)),
+		Expiry:    jose.NewNumericDate(now.Add(-time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("step-cli"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	badIssuedAt, _ := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/sign"},
+		Subject:   "test.example.com",
+		Issuer:    "step-ca-client/1.0",
+		NotBefore: jose.NewNumericDate(now),
+		Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
+		IssuedAt:  jose.NewNumericDate(now.Add(5 * time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("step-cli"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+	badAudience, _ := generateX5cToken(a1, signer, jose.Claims{
+		Audience:  []string{"https://example.com/1.0/sign"},
+		Subject:   "test.example.com",
+		Issuer:    "step-ca-client/1.0",
+		NotBefore: jose.NewNumericDate(now),
+		Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
+	}, provisioner.CertificateEnforcerFunc(func(cert *x509.Certificate) error {
+		cert.NotBefore = now
+		cert.NotAfter = now.Add(time.Hour)
+		b, err := asn1.Marshal(stepProvisionerASN1{int(provisioner.TypeJWK), []byte("step-cli"), nil, nil})
+		if err != nil {
+			return err
+		}
+		cert.ExtraExtensions = append(cert.ExtraExtensions, pkix.Extension{
+			Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1},
+			Value: b,
+		})
+		return nil
+	}))
+
+	type args struct {
+		ctx context.Context
+		ott string
+	}
+	tests := []struct {
+		name      string
+		authority *Authority
+		args      args
+		want      *x509.Certificate
+		wantErr   bool
+	}{
+		{"ok", a1, args{ctx, t1}, c1, false},
+		{"ok expired cert", a1, args{ctx, t2}, c2, false},
+		{"ok provisioner issuer", a1, args{ctx, t3}, c3, false},
+		{"ok ra provisioner", a4, args{ctx, t4}, c4, false},
+		{"fail token", a1, args{ctx, "not.a.token"}, nil, true},
+		{"fail token reuse", a1, args{ctx, t1}, nil, true},
+		{"fail token signature", a1, args{ctx, badSigner}, nil, true},
+		{"fail token provisioner", a1, args{ctx, badProvisioner}, nil, true},
+		{"fail token iss", a1, args{ctx, badIssuer}, nil, true},
+		{"fail token sub", a1, args{ctx, badSubject}, nil, true},
+		{"fail token iat", a1, args{ctx, badNotBefore}, nil, true},
+		{"fail token iat", a1, args{ctx, badExpiry}, nil, true},
+		{"fail token iat", a1, args{ctx, badIssuedAt}, nil, true},
+		{"fail token aud", a1, args{ctx, badAudience}, nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.authority.AuthorizeRenewToken(tt.args.ctx, tt.args.ott)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Authority.AuthorizeRenewToken() error = %+v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Authority.AuthorizeRenewToken() = %v, want %v", got, tt.want)
 			}
 		})
 	}

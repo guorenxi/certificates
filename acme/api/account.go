@@ -1,25 +1,29 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
-	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/v5"
+
 	"github.com/smallstep/certificates/acme"
-	"github.com/smallstep/certificates/api"
+	"github.com/smallstep/certificates/api/render"
 	"github.com/smallstep/certificates/logging"
 )
 
 // NewAccountRequest represents the payload for a new account request.
 type NewAccountRequest struct {
-	Contact              []string `json:"contact"`
-	OnlyReturnExisting   bool     `json:"onlyReturnExisting"`
-	TermsOfServiceAgreed bool     `json:"termsOfServiceAgreed"`
+	Contact                []string                `json:"contact"`
+	OnlyReturnExisting     bool                    `json:"onlyReturnExisting"`
+	TermsOfServiceAgreed   bool                    `json:"termsOfServiceAgreed"`
+	ExternalAccountBinding *ExternalAccountBinding `json:"externalAccountBinding,omitempty"`
 }
 
 func validateContacts(cs []string) error {
 	for _, c := range cs {
-		if len(c) == 0 {
+		if c == "" {
 			return acme.NewError(acme.ErrorMalformedType, "contact cannot be empty string")
 		}
 	}
@@ -64,78 +68,118 @@ func (u *UpdateAccountRequest) Validate() error {
 	}
 }
 
+// getAccountLocationPath returns the current account URL location.
+// Returned location will be of the form: https://<ca-url>/acme/<provisioner>/account/<accID>
+func getAccountLocationPath(ctx context.Context, linker acme.Linker, accID string) string {
+	return linker.GetLink(ctx, acme.AccountLinkType, accID)
+}
+
 // NewAccount is the handler resource for creating new ACME accounts.
-func (h *Handler) NewAccount(w http.ResponseWriter, r *http.Request) {
+func NewAccount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	db := acme.MustDatabaseFromContext(ctx)
+	linker := acme.MustLinkerFromContext(ctx)
+
 	payload, err := payloadFromContext(ctx)
 	if err != nil {
-		api.WriteError(w, err)
+		render.Error(w, r, err)
 		return
 	}
 	var nar NewAccountRequest
 	if err := json.Unmarshal(payload.value, &nar); err != nil {
-		api.WriteError(w, acme.WrapError(acme.ErrorMalformedType, err,
+		render.Error(w, r, acme.WrapError(acme.ErrorMalformedType, err,
 			"failed to unmarshal new-account request payload"))
 		return
 	}
 	if err := nar.Validate(); err != nil {
-		api.WriteError(w, err)
+		render.Error(w, r, err)
+		return
+	}
+
+	prov, err := acmeProvisionerFromContext(ctx)
+	if err != nil {
+		render.Error(w, r, err)
 		return
 	}
 
 	httpStatus := http.StatusCreated
-	acc, err := accountFromContext(r.Context())
+	acc, err := accountFromContext(ctx)
 	if err != nil {
-		acmeErr, ok := err.(*acme.Error)
-		if !ok || acmeErr.Status != http.StatusBadRequest {
+		var acmeErr *acme.Error
+		if !errors.As(err, &acmeErr) || acmeErr.Status != http.StatusBadRequest {
 			// Something went wrong ...
-			api.WriteError(w, err)
+			render.Error(w, r, err)
 			return
 		}
 
 		// Account does not exist //
 		if nar.OnlyReturnExisting {
-			api.WriteError(w, acme.NewError(acme.ErrorAccountDoesNotExistType,
+			render.Error(w, r, acme.NewError(acme.ErrorAccountDoesNotExistType,
 				"account does not exist"))
 			return
 		}
+
 		jwk, err := jwkFromContext(ctx)
 		if err != nil {
-			api.WriteError(w, err)
+			render.Error(w, r, err)
+			return
+		}
+
+		eak, err := validateExternalAccountBinding(ctx, &nar)
+		if err != nil {
+			render.Error(w, r, err)
 			return
 		}
 
 		acc = &acme.Account{
-			Key:     jwk,
-			Contact: nar.Contact,
-			Status:  acme.StatusValid,
+			Key:             jwk,
+			Contact:         nar.Contact,
+			Status:          acme.StatusValid,
+			LocationPrefix:  getAccountLocationPath(ctx, linker, ""),
+			ProvisionerID:   prov.ID,
+			ProvisionerName: prov.Name,
 		}
-		if err := h.db.CreateAccount(ctx, acc); err != nil {
-			api.WriteError(w, acme.WrapErrorISE(err, "error creating account"))
+		if err := db.CreateAccount(ctx, acc); err != nil {
+			render.Error(w, r, acme.WrapErrorISE(err, "error creating account"))
 			return
 		}
+
+		if eak != nil { // means that we have a (valid) External Account Binding key that should be bound, updated and sent in the response
+			if err := eak.BindTo(acc); err != nil {
+				render.Error(w, r, err)
+				return
+			}
+			if err := db.UpdateExternalAccountKey(ctx, prov.ID, eak); err != nil {
+				render.Error(w, r, acme.WrapErrorISE(err, "error updating external account binding key"))
+				return
+			}
+			acc.ExternalAccountBinding = nar.ExternalAccountBinding
+		}
 	} else {
-		// Account exists //
+		// Account exists
 		httpStatus = http.StatusOK
 	}
 
-	h.linker.LinkAccount(ctx, acc)
+	linker.LinkAccount(ctx, acc)
 
-	w.Header().Set("Location", h.linker.GetLink(r.Context(), AccountLinkType, acc.ID))
-	api.JSONStatus(w, acc, httpStatus)
+	w.Header().Set("Location", getAccountLocationPath(ctx, linker, acc.ID))
+	render.JSONStatus(w, r, acc, httpStatus)
 }
 
 // GetOrUpdateAccount is the api for updating an ACME account.
-func (h *Handler) GetOrUpdateAccount(w http.ResponseWriter, r *http.Request) {
+func GetOrUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	db := acme.MustDatabaseFromContext(ctx)
+	linker := acme.MustLinkerFromContext(ctx)
+
 	acc, err := accountFromContext(ctx)
 	if err != nil {
-		api.WriteError(w, err)
+		render.Error(w, r, err)
 		return
 	}
 	payload, err := payloadFromContext(ctx)
 	if err != nil {
-		api.WriteError(w, err)
+		render.Error(w, r, err)
 		return
 	}
 
@@ -144,12 +188,12 @@ func (h *Handler) GetOrUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	if !payload.isPostAsGet {
 		var uar UpdateAccountRequest
 		if err := json.Unmarshal(payload.value, &uar); err != nil {
-			api.WriteError(w, acme.WrapError(acme.ErrorMalformedType, err,
+			render.Error(w, r, acme.WrapError(acme.ErrorMalformedType, err,
 				"failed to unmarshal new-account request payload"))
 			return
 		}
 		if err := uar.Validate(); err != nil {
-			api.WriteError(w, err)
+			render.Error(w, r, err)
 			return
 		}
 		if len(uar.Status) > 0 || len(uar.Contact) > 0 {
@@ -159,17 +203,17 @@ func (h *Handler) GetOrUpdateAccount(w http.ResponseWriter, r *http.Request) {
 				acc.Contact = uar.Contact
 			}
 
-			if err := h.db.UpdateAccount(ctx, acc); err != nil {
-				api.WriteError(w, acme.WrapErrorISE(err, "error updating account"))
+			if err := db.UpdateAccount(ctx, acc); err != nil {
+				render.Error(w, r, acme.WrapErrorISE(err, "error updating account"))
 				return
 			}
 		}
 	}
 
-	h.linker.LinkAccount(ctx, acc)
+	linker.LinkAccount(ctx, acc)
 
-	w.Header().Set("Location", h.linker.GetLink(ctx, AccountLinkType, acc.ID))
-	api.JSON(w, acc)
+	w.Header().Set("Location", linker.GetLink(ctx, acme.AccountLinkType, acc.ID))
+	render.JSON(w, r, acc)
 }
 
 func logOrdersByAccount(w http.ResponseWriter, oids []string) {
@@ -182,26 +226,30 @@ func logOrdersByAccount(w http.ResponseWriter, oids []string) {
 }
 
 // GetOrdersByAccountID ACME api for retrieving the list of order urls belonging to an account.
-func (h *Handler) GetOrdersByAccountID(w http.ResponseWriter, r *http.Request) {
+func GetOrdersByAccountID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	db := acme.MustDatabaseFromContext(ctx)
+	linker := acme.MustLinkerFromContext(ctx)
+
 	acc, err := accountFromContext(ctx)
 	if err != nil {
-		api.WriteError(w, err)
+		render.Error(w, r, err)
 		return
 	}
 	accID := chi.URLParam(r, "accID")
 	if acc.ID != accID {
-		api.WriteError(w, acme.NewError(acme.ErrorUnauthorizedType, "account ID '%s' does not match url param '%s'", acc.ID, accID))
+		render.Error(w, r, acme.NewError(acme.ErrorUnauthorizedType, "account ID '%s' does not match url param '%s'", acc.ID, accID))
 		return
 	}
-	orders, err := h.db.GetOrdersByAccountID(ctx, acc.ID)
+
+	orders, err := db.GetOrdersByAccountID(ctx, acc.ID)
 	if err != nil {
-		api.WriteError(w, err)
+		render.Error(w, r, err)
 		return
 	}
 
-	h.linker.LinkOrdersByAccountID(ctx, orders)
+	linker.LinkOrdersByAccountID(ctx, orders)
 
-	api.JSON(w, orders)
+	render.JSON(w, r, orders)
 	logOrdersByAccount(w, orders)
 }

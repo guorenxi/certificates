@@ -7,158 +7,89 @@ on:
     - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
 
 jobs:
-  test:
-    name: Lint, Test, Build
-    runs-on: ubuntu-20.04
-    strategy:
-      matrix:
-        go: [ '1.15', '1.16' ]
-    outputs:
-      is_prerelease: ${{ steps.is_prerelease.outputs.IS_PRERELEASE }}
-    steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v2
-      -
-        name: Setup Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: ${{ matrix.go }}
-      -
-        name: Install Deps
-        id: install-deps
-        run: sudo apt-get -y install libpcsclite-dev
-      -
-        name: golangci-lint
-        uses: golangci/golangci-lint-action@v2
-        with:
-          # Optional: version of golangci-lint to use in form of v1.2 or v1.2.3 or `latest` to use the latest version
-          version: 'latest'
-
-          # Optional: working directory, useful for monorepos
-          # working-directory: somedir
-
-          # Optional: golangci-lint command line arguments.
-          args: --timeout=30m
-
-          # Optional: show only new issues if it's a pull request. The default value is `false`.
-          # only-new-issues: true
-
-          # Optional: if set to true then the action will use pre-installed Go.
-          # skip-go-installation: true
-
-          # Optional: if set to true then the action don't cache or restore ~/go/pkg.
-          # skip-pkg-cache: true
-
-          # Optional: if set to true then the action don't cache or restore ~/.cache/go-build.
-          # skip-build-cache: true
-      -
-        name: Test, Build
-        id: lint_test_build
-        run: V=1 make ci
+  ci:
+    uses: smallstep/certificates/.github/workflows/ci.yml@master
+    secrets: inherit
 
   create_release:
     name: Create Release
-    needs: test
-    runs-on: ubuntu-20.04
+    needs: ci
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_IMAGE: smallstep/step-ca
     outputs:
+      version: ${{ steps.extract-tag.outputs.VERSION }}
       is_prerelease: ${{ steps.is_prerelease.outputs.IS_PRERELEASE }}
+      docker_tags: ${{ env.DOCKER_TAGS }}
+      docker_tags_hsm: ${{ env.DOCKER_TAGS_HSM }}
     steps:
-      -
-        name: Is Pre-release
+      - name: Is Pre-release
         id: is_prerelease
         run: |
           set +e
           echo ${{ github.ref }} | grep "\-rc.*"
           OUT=$?
           if [ $OUT -eq 0 ]; then IS_PRERELEASE=true; else IS_PRERELEASE=false; fi
-          echo "::set-output name=IS_PRERELEASE::${IS_PRERELEASE}"
-      -
-        name: Create Release
+          echo "IS_PRERELEASE=${IS_PRERELEASE}" >> "${GITHUB_OUTPUT}"
+      - name: Extract Tag Names
+        id: extract-tag
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "DOCKER_TAGS=${{ env.DOCKER_IMAGE }}:${VERSION}" >> "${GITHUB_ENV}"
+          echo "DOCKER_TAGS_HSM=${{ env.DOCKER_IMAGE }}:${VERSION}-hsm" >> "${GITHUB_ENV}"
+      - name: Add Latest Tag
+        if: steps.is_prerelease.outputs.IS_PRERELEASE == 'false'
+        run: |
+          echo "DOCKER_TAGS=${{ env.DOCKER_TAGS }},${{ env.DOCKER_IMAGE }}:latest" >> "${GITHUB_ENV}"
+          echo "DOCKER_TAGS_HSM=${{ env.DOCKER_TAGS_HSM }},${{ env.DOCKER_IMAGE }}:hsm" >> "${GITHUB_ENV}"
+      - name: Create Release
         id: create_release
-        uses: actions/create-release@v1
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
           draft: false
           prerelease: ${{ steps.is_prerelease.outputs.IS_PRERELEASE }}
 
   goreleaser:
-    name: Upload Assets To Github w/ goreleaser
-    runs-on: ubuntu-20.04
     needs: create_release
-    steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-      -
-        name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: 1.16
-      -
-        name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@56f5b77f7fa4a8fe068bf22b732ec036cc9bc13f # v2.4.1
-        with:
-          version: latest
-          args: release --rm-dist
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT }}
-
-  release_deb:
-    name: Build & Upload Debian Package To Github
-    runs-on: ubuntu-20.04
-    needs: create_release
-    steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-      -
-        name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: '1.16'
-      -
-        name: APT Install
-        id: aptInstall
-        run: sudo apt-get -y install build-essential debhelper fakeroot
-      -
-        name: Build Debian package
-        id: build
-        run: |
-          PATH=$PATH:/usr/local/go/bin:/home/admin/go/bin
-          make debian
-      -
-        name: Upload Debian Package
-        id: upload_deb
-        run: |
-          tag_name="${GITHUB_REF##*/}"
-          hub release edit $(find ./.releases -type f -printf "-a %p ") -m "" "$tag_name"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+    uses: smallstep/workflows/.github/workflows/goreleaser.yml@main
+    with:
+      enable-packages-upload: true
+      is-prerelease: ${{ needs.create_release.outputs.is_prerelease == 'true' }}
+    secrets: inherit
 
   build_upload_docker:
     name: Build & Upload Docker Images
-    runs-on: ubuntu-20.04
-    needs: test
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Setup Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: '1.16'
-      - name: Build
-        id: build
-        run: |
-          PATH=$PATH:/usr/local/go/bin:/home/admin/go/bin
-          make docker-artifacts
-        env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+    needs: create_release
+    permissions:
+      id-token: write
+      contents: write
+    uses: smallstep/workflows/.github/workflows/docker-buildx-push.yml@main
+    with:
+      platforms: linux/amd64,linux/386,linux/arm,linux/arm64
+      tags: ${{ needs.create_release.outputs.docker_tags }}
+      docker_image: smallstep/step-ca
+      docker_file: docker/Dockerfile
+    secrets: inherit
+
+  build_upload_docker_hsm:
+    name: Build & Upload HSM Enabled Docker Images
+    needs: create_release
+    permissions:
+      id-token: write
+      contents: write
+    uses: smallstep/workflows/.github/workflows/docker-buildx-push.yml@main
+    with:
+      platforms: linux/amd64,linux/386,linux/arm,linux/arm64
+      tags: ${{ needs.create_release.outputs.docker_tags_hsm }}
+      docker_image: smallstep/step-ca
+      docker_file: docker/Dockerfile.hsm
+    secrets: inherit

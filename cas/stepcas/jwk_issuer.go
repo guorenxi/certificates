@@ -1,18 +1,21 @@
 package stepcas
 
 import (
+	"context"
 	"crypto"
 	"encoding/json"
 	"net/url"
 	"time"
 
 	"github.com/pkg/errors"
+
+	"github.com/smallstep/cli-utils/ui"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/randutil"
+
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/certificates/cas/apiv1"
-	"go.step.sm/cli-utils/ui"
-	"go.step.sm/crypto/jose"
-	"go.step.sm/crypto/randutil"
 )
 
 type jwkIssuer struct {
@@ -21,13 +24,13 @@ type jwkIssuer struct {
 	signer jose.Signer
 }
 
-func newJWKIssuer(caURL *url.URL, client *ca.Client, cfg *apiv1.CertificateIssuer) (*jwkIssuer, error) {
+func newJWKIssuer(ctx context.Context, caURL *url.URL, client *ca.Client, cfg *apiv1.CertificateIssuer) (*jwkIssuer, error) {
 	var err error
 	var signer jose.Signer
 	// Read the key from the CA if not provided.
 	// Or read it from a PEM file.
 	if cfg.Key == "" {
-		p, err := findProvisioner(client, provisioner.TypeJWK, cfg.Provisioner)
+		p, err := findProvisioner(ctx, client, provisioner.TypeJWK, cfg.Provisioner)
 		if err != nil {
 			return nil, err
 		}
@@ -53,25 +56,25 @@ func newJWKIssuer(caURL *url.URL, client *ca.Client, cfg *apiv1.CertificateIssue
 	}, nil
 }
 
-func (i *jwkIssuer) SignToken(subject string, sans []string) (string, error) {
+func (i *jwkIssuer) SignToken(subject string, sans []string, info *raInfo) (string, error) {
 	aud := i.caURL.ResolveReference(&url.URL{
 		Path: "/1.0/sign",
 	}).String()
-	return i.createToken(aud, subject, sans)
+	return i.createToken(aud, subject, sans, info)
 }
 
 func (i *jwkIssuer) RevokeToken(subject string) (string, error) {
 	aud := i.caURL.ResolveReference(&url.URL{
 		Path: "/1.0/revoke",
 	}).String()
-	return i.createToken(aud, subject, nil)
+	return i.createToken(aud, subject, nil, nil)
 }
 
 func (i *jwkIssuer) Lifetime(d time.Duration) time.Duration {
 	return d
 }
 
-func (i *jwkIssuer) createToken(aud, sub string, sans []string) (string, error) {
+func (i *jwkIssuer) createToken(aud, sub string, sans []string, info *raInfo) (string, error) {
 	id, err := randutil.Hex(64) // 256 bits
 	if err != nil {
 		return "", err
@@ -82,6 +85,13 @@ func (i *jwkIssuer) createToken(aud, sub string, sans []string) (string, error) 
 	if len(sans) > 0 {
 		builder = builder.Claims(map[string]interface{}{
 			"sans": sans,
+		})
+	}
+	if info != nil {
+		builder = builder.Claims(map[string]interface{}{
+			"step": map[string]interface{}{
+				"ra": info,
+			},
 		})
 	}
 
@@ -137,10 +147,10 @@ func newJWKSignerFromEncryptedKey(kid, key, password string) (jose.Signer, error
 	return newJoseSigner(signer, so)
 }
 
-func findProvisioner(client *ca.Client, typ provisioner.Type, name string) (provisioner.Interface, error) {
+func findProvisioner(ctx context.Context, client *ca.Client, typ provisioner.Type, name string) (provisioner.Interface, error) {
 	cursor := ""
 	for {
-		ps, err := client.Provisioners(ca.WithProvisionerCursor(cursor))
+		ps, err := client.ProvisionersWithContext(ctx, ca.WithProvisionerCursor(cursor))
 		if err != nil {
 			return nil, err
 		}

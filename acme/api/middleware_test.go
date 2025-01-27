@@ -6,109 +6,46 @@ import (
 	"crypto"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 
-	"github.com/pkg/errors"
+	"github.com/google/uuid"
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/acme"
-	"github.com/smallstep/nosql/database"
+	tassert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/keyutil"
 )
 
 var testBody = []byte("foo")
 
-func testNext(w http.ResponseWriter, r *http.Request) {
+func testNext(w http.ResponseWriter, _ *http.Request) {
 	w.Write(testBody)
 }
 
-func Test_baseURLFromRequest(t *testing.T) {
-	tests := []struct {
-		name            string
-		targetURL       string
-		expectedResult  *url.URL
-		requestPreparer func(*http.Request)
-	}{
-		{
-			"HTTPS host pass-through failed.",
-			"https://my.dummy.host",
-			&url.URL{Scheme: "https", Host: "my.dummy.host"},
-			nil,
-		},
-		{
-			"Port pass-through failed",
-			"https://host.with.port:8080",
-			&url.URL{Scheme: "https", Host: "host.with.port:8080"},
-			nil,
-		},
-		{
-			"Explicit host from Request.Host was not used.",
-			"https://some.target.host:8080",
-			&url.URL{Scheme: "https", Host: "proxied.host"},
-			func(r *http.Request) {
-				r.Host = "proxied.host"
-			},
-		},
-		{
-			"Missing Request.Host value did not result in empty string result.",
-			"https://some.host",
-			nil,
-			func(r *http.Request) {
-				r.Host = ""
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			request := httptest.NewRequest("GET", tc.targetURL, nil)
-			if tc.requestPreparer != nil {
-				tc.requestPreparer(request)
-			}
-			result := baseURLFromRequest(request)
-			if result == nil || tc.expectedResult == nil {
-				assert.Equals(t, result, tc.expectedResult)
-			} else if result.String() != tc.expectedResult.String() {
-				t.Errorf("Expected %q, but got %q", tc.expectedResult.String(), result.String())
-			}
-		})
-	}
-}
-
-func TestHandler_baseURLFromRequest(t *testing.T) {
-	h := &Handler{}
-	req := httptest.NewRequest("GET", "/foo", nil)
-	req.Host = "test.ca.smallstep.com:8080"
-	w := httptest.NewRecorder()
-
-	next := func(w http.ResponseWriter, r *http.Request) {
-		bu := baseURLFromContext(r.Context())
-		if assert.NotNil(t, bu) {
-			assert.Equals(t, bu.Host, "test.ca.smallstep.com:8080")
-			assert.Equals(t, bu.Scheme, "https")
+func newBaseContext(ctx context.Context, args ...interface{}) context.Context {
+	for _, a := range args {
+		switch v := a.(type) {
+		case acme.DB:
+			ctx = acme.NewDatabaseContext(ctx, v)
+		case acme.Linker:
+			ctx = acme.NewLinkerContext(ctx, v)
+		case acme.PrerequisitesChecker:
+			ctx = acme.NewPrerequisitesCheckerContext(ctx, v)
 		}
 	}
-
-	h.baseURLFromRequest(next)(w, req)
-
-	req = httptest.NewRequest("GET", "/foo", nil)
-	req.Host = ""
-
-	next = func(w http.ResponseWriter, r *http.Request) {
-		assert.Equals(t, baseURLFromContext(r.Context()), nil)
-	}
-
-	h.baseURLFromRequest(next)(w, req)
+	return ctx
 }
 
 func TestHandler_addNonce(t *testing.T) {
-	url := "https://ca.smallstep.com/acme/new-nonce"
+	u := "https://ca.smallstep.com/acme/new-nonce"
 	type test struct {
 		db         acme.DB
 		err        *acme.Error
@@ -140,15 +77,15 @@ func TestHandler_addNonce(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{db: tc.db}
-			req := httptest.NewRequest("GET", url, nil)
+			ctx := newBaseContext(context.Background(), tc.db)
+			req := httptest.NewRequest("GET", u, http.NoBody).WithContext(ctx)
 			w := httptest.NewRecorder()
-			h.addNonce(testNext)(w, req)
+			addNonce(testNext)(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -158,7 +95,6 @@ func TestHandler_addNonce(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
@@ -176,17 +112,15 @@ func TestHandler_addDirLink(t *testing.T) {
 	baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
 	type test struct {
 		link       string
-		linker     Linker
 		statusCode int
 		ctx        context.Context
 		err        *acme.Error
 	}
 	var tests = map[string]func(t *testing.T) test{
 		"ok": func(t *testing.T) test {
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
-			ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			ctx = acme.NewLinkerContext(ctx, acme.NewLinker("test.ca.smallstep.com", "acme"))
 			return test{
-				linker:     NewLinker("dns", "acme"),
 				ctx:        ctx,
 				link:       fmt.Sprintf("%s/acme/%s/directory", baseURL.String(), provName),
 				statusCode: 200,
@@ -196,16 +130,15 @@ func TestHandler_addDirLink(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{linker: tc.linker}
-			req := httptest.NewRequest("GET", "/foo", nil)
+			req := httptest.NewRequest("GET", "/foo", http.NoBody)
 			req = req.WithContext(tc.ctx)
 			w := httptest.NewRecorder()
-			h.addDirLink(testNext)(w, req)
+			addDirLink(testNext)(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -215,7 +148,6 @@ func TestHandler_addDirLink(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
@@ -230,9 +162,8 @@ func TestHandler_verifyContentType(t *testing.T) {
 	prov := newProv()
 	escProvName := url.PathEscape(prov.GetName())
 	baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
-	url := fmt.Sprintf("%s/acme/%s/certificate/abc123", baseURL.String(), escProvName)
+	u := fmt.Sprintf("%s/acme/%s/certificate/abc123", baseURL.String(), escProvName)
 	type test struct {
-		h           Handler
 		ctx         context.Context
 		contentType string
 		err         *acme.Error
@@ -242,10 +173,7 @@ func TestHandler_verifyContentType(t *testing.T) {
 	var tests = map[string]func(t *testing.T) test{
 		"fail/provisioner-not-set": func(t *testing.T) test {
 			return test{
-				h: Handler{
-					linker: NewLinker("dns", "acme"),
-				},
-				url:         url,
+				url:         u,
 				ctx:         context.Background(),
 				contentType: "foo",
 				statusCode:  500,
@@ -254,11 +182,8 @@ func TestHandler_verifyContentType(t *testing.T) {
 		},
 		"fail/general-bad-content-type": func(t *testing.T) test {
 			return test{
-				h: Handler{
-					linker: NewLinker("dns", "acme"),
-				},
-				url:         url,
-				ctx:         context.WithValue(context.Background(), provisionerContextKey, prov),
+				url:         u,
+				ctx:         acme.NewProvisionerContext(context.Background(), prov),
 				contentType: "foo",
 				statusCode:  400,
 				err:         acme.NewError(acme.ErrorMalformedType, "expected content-type to be in [application/jose+json], but got foo"),
@@ -266,10 +191,7 @@ func TestHandler_verifyContentType(t *testing.T) {
 		},
 		"fail/certificate-bad-content-type": func(t *testing.T) test {
 			return test{
-				h: Handler{
-					linker: NewLinker("dns", "acme"),
-				},
-				ctx:         context.WithValue(context.Background(), provisionerContextKey, prov),
+				ctx:         acme.NewProvisionerContext(context.Background(), prov),
 				contentType: "foo",
 				statusCode:  400,
 				err:         acme.NewError(acme.ErrorMalformedType, "expected content-type to be in [application/jose+json application/pkix-cert application/pkcs7-mime], but got foo"),
@@ -277,40 +199,28 @@ func TestHandler_verifyContentType(t *testing.T) {
 		},
 		"ok": func(t *testing.T) test {
 			return test{
-				h: Handler{
-					linker: NewLinker("dns", "acme"),
-				},
-				ctx:         context.WithValue(context.Background(), provisionerContextKey, prov),
+				ctx:         acme.NewProvisionerContext(context.Background(), prov),
 				contentType: "application/jose+json",
 				statusCode:  200,
 			}
 		},
 		"ok/certificate/pkix-cert": func(t *testing.T) test {
 			return test{
-				h: Handler{
-					linker: NewLinker("dns", "acme"),
-				},
-				ctx:         context.WithValue(context.Background(), provisionerContextKey, prov),
+				ctx:         acme.NewProvisionerContext(context.Background(), prov),
 				contentType: "application/pkix-cert",
 				statusCode:  200,
 			}
 		},
 		"ok/certificate/jose+json": func(t *testing.T) test {
 			return test{
-				h: Handler{
-					linker: NewLinker("dns", "acme"),
-				},
-				ctx:         context.WithValue(context.Background(), provisionerContextKey, prov),
+				ctx:         acme.NewProvisionerContext(context.Background(), prov),
 				contentType: "application/jose+json",
 				statusCode:  200,
 			}
 		},
 		"ok/certificate/pkcs7-mime": func(t *testing.T) test {
 			return test{
-				h: Handler{
-					linker: NewLinker("dns", "acme"),
-				},
-				ctx:         context.WithValue(context.Background(), provisionerContextKey, prov),
+				ctx:         acme.NewProvisionerContext(context.Background(), prov),
 				contentType: "application/pkcs7-mime",
 				statusCode:  200,
 			}
@@ -319,20 +229,20 @@ func TestHandler_verifyContentType(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			_url := url
+			_u := u
 			if tc.url != "" {
-				_url = tc.url
+				_u = tc.url
 			}
-			req := httptest.NewRequest("GET", _url, nil)
+			req := httptest.NewRequest("GET", _u, http.NoBody)
 			req = req.WithContext(tc.ctx)
 			req.Header.Add("Content-Type", tc.contentType)
 			w := httptest.NewRecorder()
-			tc.h.verifyContentType(testNext)(w, req)
+			verifyContentType(testNext)(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -342,7 +252,6 @@ func TestHandler_verifyContentType(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
@@ -353,7 +262,7 @@ func TestHandler_verifyContentType(t *testing.T) {
 }
 
 func TestHandler_isPostAsGet(t *testing.T) {
-	url := "https://ca.smallstep.com/acme/new-account"
+	u := "https://ca.smallstep.com/acme/new-account"
 	type test struct {
 		ctx        context.Context
 		err        *acme.Error
@@ -391,16 +300,16 @@ func TestHandler_isPostAsGet(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{}
-			req := httptest.NewRequest("GET", url, nil)
+			// h := &Handler{}
+			req := httptest.NewRequest("GET", u, http.NoBody)
 			req = req.WithContext(tc.ctx)
 			w := httptest.NewRecorder()
-			h.isPostAsGet(testNext)(w, req)
+			isPostAsGet(testNext)(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -410,7 +319,6 @@ func TestHandler_isPostAsGet(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
@@ -422,7 +330,7 @@ func TestHandler_isPostAsGet(t *testing.T) {
 
 type errReader int
 
-func (errReader) Read(p []byte) (n int, err error) {
+func (errReader) Read([]byte) (int, error) {
 	return 0, errors.New("force")
 }
 func (errReader) Close() error {
@@ -430,7 +338,7 @@ func (errReader) Close() error {
 }
 
 func TestHandler_parseJWS(t *testing.T) {
-	url := "https://ca.smallstep.com/acme/new-account"
+	u := "https://ca.smallstep.com/acme/new-account"
 	type test struct {
 		next       nextHTTP
 		body       io.Reader
@@ -449,7 +357,7 @@ func TestHandler_parseJWS(t *testing.T) {
 			return test{
 				body:       strings.NewReader("foo"),
 				statusCode: 400,
-				err:        acme.NewError(acme.ErrorMalformedType, "failed to parse JWS from request body: square/go-jose: compact JWS format must have three parts"),
+				err:        acme.NewError(acme.ErrorMalformedType, "failed to parse JWS from request body: go-jose/go-jose: compact JWS format must have three parts"),
 			}
 		},
 		"ok": func(t *testing.T) test {
@@ -482,15 +390,15 @@ func TestHandler_parseJWS(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{}
-			req := httptest.NewRequest("GET", url, tc.body)
+			// h := &Handler{}
+			req := httptest.NewRequest("GET", u, tc.body)
 			w := httptest.NewRecorder()
-			h.parseJWS(tc.next)(w, req)
+			parseJWS(tc.next)(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -500,7 +408,6 @@ func TestHandler_parseJWS(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
@@ -528,7 +435,7 @@ func TestHandler_verifyAndExtractJWSPayload(t *testing.T) {
 	assert.FatalError(t, err)
 	parsedJWS, err := jose.ParseJWS(raw)
 	assert.FatalError(t, err)
-	url := "https://ca.smallstep.com/acme/account/1234"
+	u := "https://ca.smallstep.com/acme/account/1234"
 	type test struct {
 		ctx        context.Context
 		next       func(http.ResponseWriter, *http.Request)
@@ -565,7 +472,7 @@ func TestHandler_verifyAndExtractJWSPayload(t *testing.T) {
 				err:        acme.NewErrorISE("jwk expected in request context"),
 			}
 		},
-		"fail/verify-jws-failure": func(t *testing.T) test {
+		"fail/verify-jws-failure-wrong-jwk": func(t *testing.T) test {
 			_jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
 			assert.FatalError(t, err)
 			_pub := _jwk.Public()
@@ -574,7 +481,34 @@ func TestHandler_verifyAndExtractJWSPayload(t *testing.T) {
 			return test{
 				ctx:        ctx,
 				statusCode: 400,
-				err:        acme.NewError(acme.ErrorMalformedType, "error verifying jws: square/go-jose: error in cryptographic primitive"),
+				err:        acme.NewError(acme.ErrorMalformedType, "error verifying jws: go-jose/go-jose: error in cryptographic primitive"),
+			}
+		},
+		"fail/verify-jws-failure-too-many-signatures": func(t *testing.T) test {
+			newParsedJWS, err := jose.ParseJWS(raw)
+			assert.FatalError(t, err)
+			newParsedJWS.Signatures = append(newParsedJWS.Signatures, newParsedJWS.Signatures...)
+			ctx := context.WithValue(context.Background(), jwsContextKey, newParsedJWS)
+			ctx = context.WithValue(ctx, jwkContextKey, pub)
+			return test{
+				ctx:        ctx,
+				statusCode: 400,
+				err:        acme.NewError(acme.ErrorMalformedType, "error verifying jws: go-jose/go-jose: too many signatures in payload; expecting only one"),
+			}
+		},
+		"fail/apple-acmeclient-omitting-leading-null-byte-in-signature-with-wrong-jwk": func(t *testing.T) test {
+			_jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
+			assert.FatalError(t, err)
+			_pub := _jwk.Public()
+			appleNullByteCaseBody := `{"payload":"dGVzdC0xMTA1","protected":"eyJhbGciOiJFUzI1NiJ9","signature":"rQPYKYflfKnlgBKqDeWsJH2TJ6iHAnou7sFzXlmYD4ArXqLfYuqotWERKrna2wfzh0pu7USWO2gzlOqRK9qq"}`
+			appleNullByteCaseJWS, err := jose.ParseJWS(appleNullByteCaseBody)
+			require.NoError(t, err)
+			ctx := context.WithValue(context.Background(), jwsContextKey, appleNullByteCaseJWS)
+			ctx = context.WithValue(ctx, jwkContextKey, &_pub)
+			return test{
+				ctx:        ctx,
+				statusCode: 400,
+				err:        acme.NewError(acme.ErrorMalformedType, "error verifying jws: go-jose/go-jose: error in cryptographic primitive"),
 			}
 		},
 		"fail/algorithm-mismatch": func(t *testing.T) test {
@@ -608,9 +542,6 @@ func TestHandler_verifyAndExtractJWSPayload(t *testing.T) {
 			}
 		},
 		"ok/empty-algorithm-in-jwk": func(t *testing.T) test {
-			_pub := *pub
-			clone := &_pub
-			clone.Algorithm = ""
 			ctx := context.WithValue(context.Background(), jwsContextKey, parsedJWS)
 			ctx = context.WithValue(ctx, jwkContextKey, pub)
 			return test{
@@ -676,20 +607,52 @@ func TestHandler_verifyAndExtractJWSPayload(t *testing.T) {
 				},
 			}
 		},
+		"ok/apple-acmeclient-omitting-leading-null-byte-in-signature": func(t *testing.T) test {
+			appleNullByteCaseKey := []byte(`{
+				"kid": "uioinbiTlJICL0MYsb6ar1totfRA2tiPqWgntF8xUdo",
+				"crv": "P-256",
+				"alg": "ES256",
+				"kty": "EC",
+				"x": "wlz-Kv9X0h32fzLq-cogls9HxoZQqV-GuWxdb2MCeUY",
+				"y": "xzP6zRrg_jynYljZTxfJuql_QWtdQR6lpJ52q_6Vavg"
+			}`)
+			appleNullByteCaseJWK := &jose.JSONWebKey{}
+			err = json.Unmarshal(appleNullByteCaseKey, appleNullByteCaseJWK)
+			require.NoError(t, err)
+			appleNullByteCaseBody := `{"payload":"dGVzdC0xMTA1","protected":"eyJhbGciOiJFUzI1NiJ9","signature":"rQPYKYflfKnlgBKqDeWsJH2TJ6iHAnou7sFzXlmYD4ArXqLfYuqotWERKrna2wfzh0pu7USWO2gzlOqRK9qq"}`
+			appleNullByteCaseJWS, err := jose.ParseJWS(appleNullByteCaseBody)
+			require.NoError(t, err)
+			ctx := context.WithValue(context.Background(), jwsContextKey, appleNullByteCaseJWS)
+			ctx = context.WithValue(ctx, jwkContextKey, appleNullByteCaseJWK)
+			return test{
+				ctx:        ctx,
+				statusCode: 200,
+				next: func(w http.ResponseWriter, r *http.Request) {
+					p, err := payloadFromContext(r.Context())
+					tassert.NoError(t, err)
+					if tassert.NotNil(t, p) {
+						tassert.Equal(t, []byte(`test-1105`), p.value)
+						tassert.False(t, p.isPostAsGet)
+						tassert.False(t, p.isEmptyJSON)
+					}
+					w.Write(testBody)
+				},
+			}
+		},
 	}
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{}
-			req := httptest.NewRequest("GET", url, nil)
+			// h := &Handler{}
+			req := httptest.NewRequest("GET", u, http.NoBody)
 			req = req.WithContext(tc.ctx)
 			w := httptest.NewRecorder()
-			h.verifyAndExtractJWSPayload(tc.next)(w, req)
+			verifyAndExtractJWSPayload(tc.next)(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -699,7 +662,6 @@ func TestHandler_verifyAndExtractJWSPayload(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
@@ -713,7 +675,7 @@ func TestHandler_lookupJWK(t *testing.T) {
 	prov := newProv()
 	provName := url.PathEscape(prov.GetName())
 	baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
-	url := fmt.Sprintf("%s/acme/%s/account/1234",
+	u := fmt.Sprintf("%s/acme/%s/account/1234",
 		baseURL, provName)
 	jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
 	assert.FatalError(t, err)
@@ -734,7 +696,7 @@ func TestHandler_lookupJWK(t *testing.T) {
 	parsedJWS, err := jose.ParseJWS(raw)
 	assert.FatalError(t, err)
 	type test struct {
-		linker     Linker
+		linker     acme.Linker
 		db         acme.DB
 		ctx        context.Context
 		next       func(http.ResponseWriter, *http.Request)
@@ -744,15 +706,19 @@ func TestHandler_lookupJWK(t *testing.T) {
 	var tests = map[string]func(t *testing.T) test{
 		"fail/no-jws": func(t *testing.T) test {
 			return test{
-				ctx:        context.WithValue(context.Background(), provisionerContextKey, prov),
+				db:         &acme.MockDB{},
+				linker:     acme.NewLinker("test.ca.smallstep.com", "acme"),
+				ctx:        acme.NewProvisionerContext(context.Background(), prov),
 				statusCode: 500,
 				err:        acme.NewErrorISE("jws expected in request context"),
 			}
 		},
 		"fail/nil-jws": func(t *testing.T) test {
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, nil)
 			return test{
+				db:         &acme.MockDB{},
+				linker:     acme.NewLinker("test.ca.smallstep.com", "acme"),
 				ctx:        ctx,
 				statusCode: 500,
 				err:        acme.NewErrorISE("jws expected in request context"),
@@ -766,50 +732,25 @@ func TestHandler_lookupJWK(t *testing.T) {
 			assert.FatalError(t, err)
 			_jws, err := _signer.Sign([]byte("baz"))
 			assert.FatalError(t, err)
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, _jws)
-			ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
 			return test{
-				linker:     NewLinker("dns", "acme"),
+				db:         &acme.MockDB{},
+				linker:     acme.NewLinker("test.ca.smallstep.com", "acme"),
 				ctx:        ctx,
 				statusCode: 400,
-				err:        acme.NewError(acme.ErrorMalformedType, "kid does not have required prefix; expected %s, but got ", prefix),
-			}
-		},
-		"fail/bad-kid-prefix": func(t *testing.T) test {
-			_so := new(jose.SignerOptions)
-			_so.WithHeader("kid", "foo")
-			_signer, err := jose.NewSigner(jose.SigningKey{
-				Algorithm: jose.SignatureAlgorithm(jwk.Algorithm),
-				Key:       jwk.Key,
-			}, _so)
-			assert.FatalError(t, err)
-			_jws, err := _signer.Sign([]byte("baz"))
-			assert.FatalError(t, err)
-			_raw, err := _jws.CompactSerialize()
-			assert.FatalError(t, err)
-			_parsed, err := jose.ParseJWS(_raw)
-			assert.FatalError(t, err)
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
-			ctx = context.WithValue(ctx, jwsContextKey, _parsed)
-			ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
-			return test{
-				linker:     NewLinker("dns", "acme"),
-				ctx:        ctx,
-				statusCode: 400,
-				err:        acme.NewError(acme.ErrorMalformedType, "kid does not have required prefix; expected %s, but got foo", prefix),
+				err:        acme.NewError(acme.ErrorMalformedType, "signature missing 'kid'"),
 			}
 		},
 		"fail/account-not-found": func(t *testing.T) test {
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
-			ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
 			return test{
-				linker: NewLinker("dns", "acme"),
+				linker: acme.NewLinker("test.ca.smallstep.com", "acme"),
 				db: &acme.MockDB{
 					MockGetAccount: func(ctx context.Context, accID string) (*acme.Account, error) {
 						assert.Equals(t, accID, accID)
-						return nil, database.ErrNotFound
+						return nil, acme.ErrNotFound
 					},
 				},
 				ctx:        ctx,
@@ -818,11 +759,10 @@ func TestHandler_lookupJWK(t *testing.T) {
 			}
 		},
 		"fail/GetAccount-error": func(t *testing.T) test {
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
-			ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
 			return test{
-				linker: NewLinker("dns", "acme"),
+				linker: acme.NewLinker("test.ca.smallstep.com", "acme"),
 				db: &acme.MockDB{
 					MockGetAccount: func(ctx context.Context, id string) (*acme.Account, error) {
 						assert.Equals(t, id, accID)
@@ -836,11 +776,10 @@ func TestHandler_lookupJWK(t *testing.T) {
 		},
 		"fail/account-not-valid": func(t *testing.T) test {
 			acc := &acme.Account{Status: "deactivated"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
-			ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
 			return test{
-				linker: NewLinker("dns", "acme"),
+				linker: acme.NewLinker("test.ca.smallstep.com", "acme"),
 				db: &acme.MockDB{
 					MockGetAccount: func(ctx context.Context, id string) (*acme.Account, error) {
 						assert.Equals(t, id, accID)
@@ -852,13 +791,137 @@ func TestHandler_lookupJWK(t *testing.T) {
 				err:        acme.NewError(acme.ErrorUnauthorizedType, "account is not active"),
 			}
 		},
-		"ok": func(t *testing.T) test {
-			acc := &acme.Account{Status: "valid", Key: jwk}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+		"fail/account-with-location-prefix/bad-kid": func(t *testing.T) test {
+			acc := &acme.Account{LocationPrefix: "foobar", Status: "valid"}
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
-			ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
 			return test{
-				linker: NewLinker("dns", "acme"),
+				linker: acme.NewLinker("test.ca.smallstep.com", "acme"),
+				db: &acme.MockDB{
+					MockGetAccount: func(ctx context.Context, id string) (*acme.Account, error) {
+						assert.Equals(t, id, accID)
+						return acc, nil
+					},
+				},
+				ctx:        ctx,
+				statusCode: http.StatusUnauthorized,
+				err:        acme.NewError(acme.ErrorUnauthorizedType, "kid does not match stored account location; expected foobar, but %q", prefix+accID),
+			}
+		},
+		"fail/account-with-location-prefix/bad-provisioner": func(t *testing.T) test {
+			acc := &acme.Account{LocationPrefix: prefix + accID, Status: "valid", Key: jwk, ProvisionerName: "other"}
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
+			return test{
+				linker: acme.NewLinker("test.ca.smallstep.com", "acme"),
+				db: &acme.MockDB{
+					MockGetAccount: func(ctx context.Context, id string) (*acme.Account, error) {
+						assert.Equals(t, id, accID)
+						return acc, nil
+					},
+				},
+				ctx: ctx,
+				next: func(w http.ResponseWriter, r *http.Request) {
+					_acc, err := accountFromContext(r.Context())
+					assert.FatalError(t, err)
+					assert.Equals(t, _acc, acc)
+					_jwk, err := jwkFromContext(r.Context())
+					assert.FatalError(t, err)
+					assert.Equals(t, _jwk, jwk)
+					w.Write(testBody)
+				},
+				statusCode: http.StatusUnauthorized,
+				err: acme.NewError(acme.ErrorUnauthorizedType,
+					"account provisioner does not match requested provisioner; account provisioner = %s, requested provisioner = %s",
+					"other", prov.GetName()),
+			}
+		},
+		"fail/account-with-location-prefix/bad-provisioner-id": func(t *testing.T) test {
+			p := newProvWithID()
+			acc := &acme.Account{LocationPrefix: prefix + accID, Status: "valid", Key: jwk, ProvisionerID: uuid.NewString()}
+			ctx := acme.NewProvisionerContext(context.Background(), p)
+			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
+			return test{
+				linker: acme.NewLinker("test.ca.smallstep.com", "acme"),
+				db: &acme.MockDB{
+					MockGetAccount: func(ctx context.Context, id string) (*acme.Account, error) {
+						assert.Equals(t, id, accID)
+						return acc, nil
+					},
+				},
+				ctx: ctx,
+				next: func(w http.ResponseWriter, r *http.Request) {
+					_acc, err := accountFromContext(r.Context())
+					assert.FatalError(t, err)
+					assert.Equals(t, _acc, acc)
+					_jwk, err := jwkFromContext(r.Context())
+					assert.FatalError(t, err)
+					assert.Equals(t, _jwk, jwk)
+					w.Write(testBody)
+				},
+				statusCode: http.StatusUnauthorized,
+				err: acme.NewError(acme.ErrorUnauthorizedType,
+					"account provisioner does not match requested provisioner; account provisioner = %s, requested provisioner = %s",
+					acc.ProvisionerID, p.GetID()),
+			}
+		},
+		"ok/account-with-location-prefix": func(t *testing.T) test {
+			acc := &acme.Account{LocationPrefix: prefix + accID, Status: "valid", Key: jwk, ProvisionerName: prov.GetName()}
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
+			return test{
+				linker: acme.NewLinker("test.ca.smallstep.com", "acme"),
+				db: &acme.MockDB{
+					MockGetAccount: func(ctx context.Context, id string) (*acme.Account, error) {
+						assert.Equals(t, id, accID)
+						return acc, nil
+					},
+				},
+				ctx: ctx,
+				next: func(w http.ResponseWriter, r *http.Request) {
+					_acc, err := accountFromContext(r.Context())
+					assert.FatalError(t, err)
+					assert.Equals(t, _acc, acc)
+					_jwk, err := jwkFromContext(r.Context())
+					assert.FatalError(t, err)
+					assert.Equals(t, _jwk, jwk)
+					w.Write(testBody)
+				},
+				statusCode: http.StatusOK,
+			}
+		},
+		"ok/account-without-location-prefix": func(t *testing.T) test {
+			acc := &acme.Account{Status: "valid", Key: jwk}
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
+			return test{
+				linker: acme.NewLinker("test.ca.smallstep.com", "acme"),
+				db: &acme.MockDB{
+					MockGetAccount: func(ctx context.Context, id string) (*acme.Account, error) {
+						assert.Equals(t, id, accID)
+						return acc, nil
+					},
+				},
+				ctx: ctx,
+				next: func(w http.ResponseWriter, r *http.Request) {
+					_acc, err := accountFromContext(r.Context())
+					assert.FatalError(t, err)
+					assert.Equals(t, _acc, acc)
+					_jwk, err := jwkFromContext(r.Context())
+					assert.FatalError(t, err)
+					assert.Equals(t, _jwk, jwk)
+					w.Write(testBody)
+				},
+				statusCode: 200,
+			}
+		},
+		"ok/account-with-provisioner-id": func(t *testing.T) test {
+			p := newProvWithID()
+			acc := &acme.Account{LocationPrefix: prefix + accID, Status: "valid", Key: jwk, ProvisionerID: p.GetID()}
+			ctx := acme.NewProvisionerContext(context.Background(), p)
+			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
+			return test{
+				linker: acme.NewLinker("test.ca.smallstep.com", "acme"),
 				db: &acme.MockDB{
 					MockGetAccount: func(ctx context.Context, id string) (*acme.Account, error) {
 						assert.Equals(t, id, accID)
@@ -882,16 +945,16 @@ func TestHandler_lookupJWK(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{db: tc.db, linker: tc.linker}
-			req := httptest.NewRequest("GET", url, nil)
-			req = req.WithContext(tc.ctx)
+			ctx := newBaseContext(tc.ctx, tc.db, tc.linker)
+			req := httptest.NewRequest("GET", u, http.NoBody)
+			req = req.WithContext(ctx)
 			w := httptest.NewRecorder()
-			h.lookupJWK(tc.next)(w, req)
+			lookupJWK(tc.next)(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -901,7 +964,6 @@ func TestHandler_lookupJWK(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
@@ -934,7 +996,7 @@ func TestHandler_extractJWK(t *testing.T) {
 	assert.FatalError(t, err)
 	parsedJWS, err := jose.ParseJWS(raw)
 	assert.FatalError(t, err)
-	url := fmt.Sprintf("https://ca.smallstep.com/acme/%s/account/1234",
+	u := fmt.Sprintf("https://ca.smallstep.com/acme/%s/account/1234",
 		provName)
 	type test struct {
 		db         acme.DB
@@ -946,15 +1008,17 @@ func TestHandler_extractJWK(t *testing.T) {
 	var tests = map[string]func(t *testing.T) test{
 		"fail/no-jws": func(t *testing.T) test {
 			return test{
-				ctx:        context.WithValue(context.Background(), provisionerContextKey, prov),
+				db:         &acme.MockDB{},
+				ctx:        acme.NewProvisionerContext(context.Background(), prov),
 				statusCode: 500,
 				err:        acme.NewErrorISE("jws expected in request context"),
 			}
 		},
 		"fail/nil-jws": func(t *testing.T) test {
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, nil)
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        ctx,
 				statusCode: 500,
 				err:        acme.NewErrorISE("jws expected in request context"),
@@ -970,9 +1034,10 @@ func TestHandler_extractJWK(t *testing.T) {
 					},
 				},
 			}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, _jws)
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        ctx,
 				statusCode: 400,
 				err:        acme.NewError(acme.ErrorMalformedType, "jwk expected in protected header"),
@@ -988,16 +1053,17 @@ func TestHandler_extractJWK(t *testing.T) {
 					},
 				},
 			}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, _jws)
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        ctx,
 				statusCode: 400,
 				err:        acme.NewError(acme.ErrorMalformedType, "invalid jwk in protected header"),
 			}
 		},
 		"fail/GetAccountByKey-error": func(t *testing.T) test {
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
 			return test{
 				ctx: ctx,
@@ -1013,7 +1079,7 @@ func TestHandler_extractJWK(t *testing.T) {
 		},
 		"fail/account-not-valid": func(t *testing.T) test {
 			acc := &acme.Account{Status: "deactivated"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
 			return test{
 				ctx: ctx,
@@ -1029,7 +1095,7 @@ func TestHandler_extractJWK(t *testing.T) {
 		},
 		"ok": func(t *testing.T) test {
 			acc := &acme.Account{Status: "valid"}
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
 			return test{
 				ctx: ctx,
@@ -1052,7 +1118,7 @@ func TestHandler_extractJWK(t *testing.T) {
 			}
 		},
 		"ok/no-account": func(t *testing.T) test {
-			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
 			return test{
 				ctx: ctx,
@@ -1078,16 +1144,16 @@ func TestHandler_extractJWK(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{db: tc.db}
-			req := httptest.NewRequest("GET", url, nil)
-			req = req.WithContext(tc.ctx)
+			ctx := newBaseContext(tc.ctx, tc.db)
+			req := httptest.NewRequest("GET", u, http.NoBody)
+			req = req.WithContext(ctx)
 			w := httptest.NewRecorder()
-			h.extractJWK(tc.next)(w, req)
+			extractJWK(tc.next)(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -1097,7 +1163,6 @@ func TestHandler_extractJWK(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
@@ -1108,7 +1173,7 @@ func TestHandler_extractJWK(t *testing.T) {
 }
 
 func TestHandler_validateJWS(t *testing.T) {
-	url := "https://ca.smallstep.com/acme/account/1234"
+	u := "https://ca.smallstep.com/acme/account/1234"
 	type test struct {
 		db         acme.DB
 		ctx        context.Context
@@ -1119,6 +1184,7 @@ func TestHandler_validateJWS(t *testing.T) {
 	var tests = map[string]func(t *testing.T) test{
 		"fail/no-jws": func(t *testing.T) test {
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        context.Background(),
 				statusCode: 500,
 				err:        acme.NewErrorISE("jws expected in request context"),
@@ -1126,6 +1192,7 @@ func TestHandler_validateJWS(t *testing.T) {
 		},
 		"fail/nil-jws": func(t *testing.T) test {
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        context.WithValue(context.Background(), jwsContextKey, nil),
 				statusCode: 500,
 				err:        acme.NewErrorISE("jws expected in request context"),
@@ -1133,6 +1200,7 @@ func TestHandler_validateJWS(t *testing.T) {
 		},
 		"fail/no-signature": func(t *testing.T) test {
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        context.WithValue(context.Background(), jwsContextKey, &jose.JSONWebSignature{}),
 				statusCode: 400,
 				err:        acme.NewError(acme.ErrorMalformedType, "request body does not contain a signature"),
@@ -1146,6 +1214,7 @@ func TestHandler_validateJWS(t *testing.T) {
 				},
 			}
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        context.WithValue(context.Background(), jwsContextKey, jws),
 				statusCode: 400,
 				err:        acme.NewError(acme.ErrorMalformedType, "request body contains more than one signature"),
@@ -1158,6 +1227,7 @@ func TestHandler_validateJWS(t *testing.T) {
 				},
 			}
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        context.WithValue(context.Background(), jwsContextKey, jws),
 				statusCode: 400,
 				err:        acme.NewError(acme.ErrorMalformedType, "unprotected header must not be used"),
@@ -1170,6 +1240,7 @@ func TestHandler_validateJWS(t *testing.T) {
 				},
 			}
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        context.WithValue(context.Background(), jwsContextKey, jws),
 				statusCode: 400,
 				err:        acme.NewError(acme.ErrorBadSignatureAlgorithmType, "unsuitable algorithm: none"),
@@ -1182,6 +1253,7 @@ func TestHandler_validateJWS(t *testing.T) {
 				},
 			}
 			return test{
+				db:         &acme.MockDB{},
 				ctx:        context.WithValue(context.Background(), jwsContextKey, jws),
 				statusCode: 400,
 				err:        acme.NewError(acme.ErrorBadSignatureAlgorithmType, "unsuitable algorithm: %s", jose.HS256),
@@ -1198,7 +1270,7 @@ func TestHandler_validateJWS(t *testing.T) {
 							Algorithm:  jose.RS256,
 							JSONWebKey: &pub,
 							ExtraHeaders: map[jose.HeaderKey]interface{}{
-								"url": url,
+								"url": u,
 							},
 						},
 					},
@@ -1216,6 +1288,8 @@ func TestHandler_validateJWS(t *testing.T) {
 			}
 		},
 		"fail/rsa-key-too-small": func(t *testing.T) test {
+			revert := keyutil.Insecure()
+			defer revert()
 			jwk, err := jose.GenerateJWK("RSA", "", "", "sig", "", 1024)
 			assert.FatalError(t, err)
 			pub := jwk.Public()
@@ -1226,7 +1300,7 @@ func TestHandler_validateJWS(t *testing.T) {
 							Algorithm:  jose.RS256,
 							JSONWebKey: &pub,
 							ExtraHeaders: map[jose.HeaderKey]interface{}{
-								"url": url,
+								"url": u,
 							},
 						},
 					},
@@ -1298,7 +1372,7 @@ func TestHandler_validateJWS(t *testing.T) {
 				},
 				ctx:        context.WithValue(context.Background(), jwsContextKey, jws),
 				statusCode: 400,
-				err:        acme.NewError(acme.ErrorMalformedType, "url header in JWS (foo) does not match request url (%s)", url),
+				err:        acme.NewError(acme.ErrorMalformedType, "url header in JWS (foo) does not match request url (%s)", u),
 			}
 		},
 		"fail/both-jwk-kid": func(t *testing.T) test {
@@ -1313,7 +1387,7 @@ func TestHandler_validateJWS(t *testing.T) {
 							KeyID:      "bar",
 							JSONWebKey: &pub,
 							ExtraHeaders: map[jose.HeaderKey]interface{}{
-								"url": url,
+								"url": u,
 							},
 						},
 					},
@@ -1337,7 +1411,7 @@ func TestHandler_validateJWS(t *testing.T) {
 						Protected: jose.Header{
 							Algorithm: jose.ES256,
 							ExtraHeaders: map[jose.HeaderKey]interface{}{
-								"url": url,
+								"url": u,
 							},
 						},
 					},
@@ -1362,7 +1436,7 @@ func TestHandler_validateJWS(t *testing.T) {
 							Algorithm: jose.ES256,
 							KeyID:     "bar",
 							ExtraHeaders: map[jose.HeaderKey]interface{}{
-								"url": url,
+								"url": u,
 							},
 						},
 					},
@@ -1392,7 +1466,7 @@ func TestHandler_validateJWS(t *testing.T) {
 							Algorithm:  jose.ES256,
 							JSONWebKey: &pub,
 							ExtraHeaders: map[jose.HeaderKey]interface{}{
-								"url": url,
+								"url": u,
 							},
 						},
 					},
@@ -1422,7 +1496,7 @@ func TestHandler_validateJWS(t *testing.T) {
 							Algorithm:  jose.RS256,
 							JSONWebKey: &pub,
 							ExtraHeaders: map[jose.HeaderKey]interface{}{
-								"url": url,
+								"url": u,
 							},
 						},
 					},
@@ -1445,16 +1519,16 @@ func TestHandler_validateJWS(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			h := &Handler{db: tc.db}
-			req := httptest.NewRequest("GET", url, nil)
-			req = req.WithContext(tc.ctx)
+			ctx := newBaseContext(tc.ctx, tc.db)
+			req := httptest.NewRequest("GET", u, http.NoBody)
+			req = req.WithContext(ctx)
 			w := httptest.NewRecorder()
-			h.validateJWS(tc.next)(w, req)
+			validateJWS(tc.next)(w, req)
 			res := w.Result()
 
 			assert.Equals(t, res.StatusCode, tc.statusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 
@@ -1464,12 +1538,360 @@ func TestHandler_validateJWS(t *testing.T) {
 
 				assert.Equals(t, ae.Type, tc.err.Type)
 				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
 				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
 			} else {
 				assert.Equals(t, bytes.TrimSpace(body), testBody)
 			}
+		})
+	}
+}
+
+func Test_canExtractJWKFrom(t *testing.T) {
+	jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
+	assert.FatalError(t, err)
+	type args struct {
+		jws *jose.JSONWebSignature
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "no-jws",
+			args: args{
+				jws: nil,
+			},
+			want: false,
+		},
+		{
+			name: "no-signatures",
+			args: args{
+				jws: &jose.JSONWebSignature{
+					Signatures: []jose.Signature{},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "no-jwk",
+			args: args{
+				jws: &jose.JSONWebSignature{
+					Signatures: []jose.Signature{
+						{
+							Protected: jose.Header{},
+						},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "ok",
+			args: args{
+				jws: &jose.JSONWebSignature{
+					Signatures: []jose.Signature{
+						{
+							Protected: jose.Header{
+								JSONWebKey: jwk,
+							},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := canExtractJWKFrom(tt.args.jws); got != tt.want {
+				t.Errorf("canExtractJWKFrom() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandler_extractOrLookupJWK(t *testing.T) {
+	u := "https://ca.smallstep.com/acme/account"
+	type test struct {
+		db         acme.DB
+		linker     acme.Linker
+		statusCode int
+		ctx        context.Context
+		err        *acme.Error
+		next       func(w http.ResponseWriter, r *http.Request)
+	}
+	var tests = map[string]func(t *testing.T) test{
+		"ok/extract": func(t *testing.T) test {
+			jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
+			assert.FatalError(t, err)
+			kid, err := jwk.Thumbprint(crypto.SHA256)
+			assert.FatalError(t, err)
+			pub := jwk.Public()
+			pub.KeyID = base64.RawURLEncoding.EncodeToString(kid)
+			so := new(jose.SignerOptions)
+			so.WithHeader("jwk", pub) // JWK for certificate private key flow
+			signer, err := jose.NewSigner(jose.SigningKey{
+				Algorithm: jose.SignatureAlgorithm(jwk.Algorithm),
+				Key:       jwk.Key,
+			}, so)
+			assert.FatalError(t, err)
+			signed, err := signer.Sign([]byte("foo"))
+			assert.FatalError(t, err)
+			raw, err := signed.CompactSerialize()
+			assert.FatalError(t, err)
+			parsedJWS, err := jose.ParseJWS(raw)
+			assert.FatalError(t, err)
+			return test{
+				linker: acme.NewLinker("dns", "acme"),
+				db: &acme.MockDB{
+					MockGetAccountByKeyID: func(ctx context.Context, kid string) (*acme.Account, error) {
+						assert.Equals(t, kid, pub.KeyID)
+						return nil, acme.ErrNotFound
+					},
+				},
+				ctx:        context.WithValue(context.Background(), jwsContextKey, parsedJWS),
+				statusCode: 200,
+				next: func(w http.ResponseWriter, r *http.Request) {
+					w.Write(testBody)
+				},
+			}
+		},
+		"ok/lookup": func(t *testing.T) test {
+			prov := newProv()
+			provName := url.PathEscape(prov.GetName())
+			baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
+			jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
+			assert.FatalError(t, err)
+			accID := "accID"
+			prefix := fmt.Sprintf("%s/acme/%s/account/", baseURL, provName)
+			so := new(jose.SignerOptions)
+			so.WithHeader("kid", fmt.Sprintf("%s%s", prefix, accID)) // KID for account private key flow
+			signer, err := jose.NewSigner(jose.SigningKey{
+				Algorithm: jose.SignatureAlgorithm(jwk.Algorithm),
+				Key:       jwk.Key,
+			}, so)
+			assert.FatalError(t, err)
+			jws, err := signer.Sign([]byte("baz"))
+			assert.FatalError(t, err)
+			raw, err := jws.CompactSerialize()
+			assert.FatalError(t, err)
+			parsedJWS, err := jose.ParseJWS(raw)
+			assert.FatalError(t, err)
+			acc := &acme.Account{ID: "accID", Key: jwk, Status: "valid"}
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			ctx = context.WithValue(ctx, jwsContextKey, parsedJWS)
+			return test{
+				linker: acme.NewLinker("test.ca.smallstep.com", "acme"),
+				db: &acme.MockDB{
+					MockGetAccount: func(ctx context.Context, accID string) (*acme.Account, error) {
+						assert.Equals(t, accID, acc.ID)
+						return acc, nil
+					},
+				},
+				ctx:        ctx,
+				statusCode: 200,
+				next: func(w http.ResponseWriter, r *http.Request) {
+					w.Write(testBody)
+				},
+			}
+		},
+	}
+	for name, prep := range tests {
+		tc := prep(t)
+		t.Run(name, func(t *testing.T) {
+			ctx := newBaseContext(tc.ctx, tc.db, tc.linker)
+			req := httptest.NewRequest("GET", u, http.NoBody)
+			req = req.WithContext(ctx)
+			w := httptest.NewRecorder()
+			extractOrLookupJWK(tc.next)(w, req)
+			res := w.Result()
+
+			assert.Equals(t, res.StatusCode, tc.statusCode)
+
+			body, err := io.ReadAll(res.Body)
+			res.Body.Close()
+			assert.FatalError(t, err)
+
+			if res.StatusCode >= 400 && assert.NotNil(t, tc.err) {
+				var ae acme.Error
+				assert.FatalError(t, json.Unmarshal(bytes.TrimSpace(body), &ae))
+
+				assert.Equals(t, ae.Type, tc.err.Type)
+				assert.Equals(t, ae.Detail, tc.err.Detail)
+				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
+				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
+			} else {
+				assert.Equals(t, bytes.TrimSpace(body), testBody)
+			}
+		})
+	}
+}
+
+func TestHandler_checkPrerequisites(t *testing.T) {
+	prov := newProv()
+	provName := url.PathEscape(prov.GetName())
+	baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
+	u := fmt.Sprintf("%s/acme/%s/account/1234",
+		baseURL, provName)
+	type test struct {
+		linker               acme.Linker
+		ctx                  context.Context
+		prerequisitesChecker func(context.Context) (bool, error)
+		next                 func(http.ResponseWriter, *http.Request)
+		err                  *acme.Error
+		statusCode           int
+	}
+	var tests = map[string]func(t *testing.T) test{
+		"fail/error": func(t *testing.T) test {
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			return test{
+				linker:               acme.NewLinker("dns", "acme"),
+				ctx:                  ctx,
+				prerequisitesChecker: func(context.Context) (bool, error) { return false, errors.New("force") },
+				next: func(w http.ResponseWriter, r *http.Request) {
+					w.Write(testBody)
+				},
+				err:        acme.WrapErrorISE(errors.New("force"), "error checking acme provisioner prerequisites"),
+				statusCode: 500,
+			}
+		},
+		"fail/prerequisites-nok": func(t *testing.T) test {
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			return test{
+				linker:               acme.NewLinker("dns", "acme"),
+				ctx:                  ctx,
+				prerequisitesChecker: func(context.Context) (bool, error) { return false, nil },
+				next: func(w http.ResponseWriter, r *http.Request) {
+					w.Write(testBody)
+				},
+				err:        acme.NewError(acme.ErrorNotImplementedType, "acme provisioner configuration lacks prerequisites"),
+				statusCode: 501,
+			}
+		},
+		"ok": func(t *testing.T) test {
+			ctx := acme.NewProvisionerContext(context.Background(), prov)
+			return test{
+				linker:               acme.NewLinker("dns", "acme"),
+				ctx:                  ctx,
+				prerequisitesChecker: func(context.Context) (bool, error) { return true, nil },
+				next: func(w http.ResponseWriter, r *http.Request) {
+					w.Write(testBody)
+				},
+				statusCode: 200,
+			}
+		},
+	}
+	for name, run := range tests {
+		tc := run(t)
+		t.Run(name, func(t *testing.T) {
+			ctx := acme.NewPrerequisitesCheckerContext(tc.ctx, tc.prerequisitesChecker)
+			req := httptest.NewRequest("GET", u, http.NoBody)
+			req = req.WithContext(ctx)
+			w := httptest.NewRecorder()
+			checkPrerequisites(tc.next)(w, req)
+			res := w.Result()
+
+			assert.Equals(t, res.StatusCode, tc.statusCode)
+
+			body, err := io.ReadAll(res.Body)
+			res.Body.Close()
+			assert.FatalError(t, err)
+
+			if res.StatusCode >= 400 && assert.NotNil(t, tc.err) {
+				var ae acme.Error
+				assert.FatalError(t, json.Unmarshal(bytes.TrimSpace(body), &ae))
+				assert.Equals(t, ae.Type, tc.err.Type)
+				assert.Equals(t, ae.Detail, tc.err.Detail)
+				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
+				assert.Equals(t, res.Header["Content-Type"], []string{"application/problem+json"})
+			} else {
+				assert.Equals(t, bytes.TrimSpace(body), testBody)
+			}
+		})
+	}
+}
+
+func Test_retryVerificationWithPatchedSignatures(t *testing.T) {
+	patchedRKey := []byte(`{
+		"kid": "uioinbiTlJICL0MYsb6ar1totfRA2tiPqWgntF8xUdo",
+		"crv": "P-256",
+		"alg": "ES256",
+		"kty": "EC",
+		"x": "wlz-Kv9X0h32fzLq-cogls9HxoZQqV-GuWxdb2MCeUY",
+		"y": "xzP6zRrg_jynYljZTxfJuql_QWtdQR6lpJ52q_6Vavg"
+	}`)
+	patchedRJWK := &jose.JSONWebKey{}
+	err := json.Unmarshal(patchedRKey, patchedRJWK)
+	require.NoError(t, err)
+	patchedRBody := `{"payload":"dGVzdC0xMTA1","protected":"eyJhbGciOiJFUzI1NiJ9","signature":"rQPYKYflfKnlgBKqDeWsJH2TJ6iHAnou7sFzXlmYD4ArXqLfYuqotWERKrna2wfzh0pu7USWO2gzlOqRK9qq"}`
+	patchedR, err := jose.ParseJWS(patchedRBody)
+	require.NoError(t, err)
+
+	patchedSKey := []byte(`{
+		"kid": "PblXsnK59uTiF5k3mmAN2B6HDPPxqBL_4UGhEG8ZO6g",
+		"crv": "P-256",
+		"alg": "ES256",
+		"kty": "EC",
+		"x": "T5aM_TOSattXNeUkH1VHZXh8URzdjZTI2zLvVgI0cy0",
+		"y": "Lf8h8qZnURXIxm6OnQ69kxGC91YtTZRD2GAroEf1UA8"
+	}`)
+	patchedSJWK := &jose.JSONWebKey{}
+	err = json.Unmarshal(patchedSKey, patchedSJWK)
+	require.NoError(t, err)
+	patchedSBody := `{"payload":"dGVzdC02Ng","protected":"eyJhbGciOiJFUzI1NiJ9","signature":"krtSKSgVB04oqx6i9QLeal_wZSnjV1_PSIM3AubT0WRIxnhl_yYbVpa3i53p3dUW56TtP6_SUZboH6SvLHMz"}`
+	patchedS, err := jose.ParseJWS(patchedSBody)
+	require.NoError(t, err)
+
+	patchedRSKey := []byte(`{
+		"kid": "U8BmBVbZsNUawvhOomJQPa6uYj1rdxCPQWF_nOLVsc4",
+		"crv": "P-256",
+		"alg": "ES256",
+		"kty": "EC",
+		"x": "Ym0l3GMS6aHBLo-xe73Kub4kafnOBu_QAfOsx5y-bV0",
+		"y": "wKijX9Cu67HbK94StPcI18WulgRfIMbP2ZU7gQuf3-M"
+	}`)
+	patchedRSJWK := &jose.JSONWebKey{}
+	err = json.Unmarshal(patchedRSKey, patchedRSJWK)
+	require.NoError(t, err)
+	patchedRSBody := `{"payload":"dGVzdC05MDY3","protected":"eyJhbGciOiJFUzI1NiJ9","signature":"2r_My19oRg7mWf9I5JTkNYp8otfEMz-yXRA8ltZTAKZxyJLurpVEgicmNItu7lfcCrGrTgI3Obye_gSaIyc"}`
+	patchedRS, err := jose.ParseJWS(patchedRSBody)
+	require.NoError(t, err)
+
+	patchedRWithWrongJWK, err := jose.ParseJWS(patchedRBody)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name              string
+		jws               *jose.JSONWebSignature
+		jwk               *jose.JSONWebKey
+		expectedData      []byte
+		expectedSignature string
+		expectedError     error
+	}{
+		{"ok/patched-r", patchedR, patchedRJWK, []byte(`test-1105`), `AK0D2CmH5Xyp5YASqg3lrCR9kyeohwJ6Lu7Bc15ZmA-AK16i32LqqLVhESq52tsH84dKbu1EljtoM5TqkSvaqg`, nil},
+		{"ok/patched-s", patchedS, patchedSJWK, []byte(`test-66`), `krtSKSgVB04oqx6i9QLeal_wZSnjV1_PSIM3AubT0WQASMZ4Zf8mG1aWt4ud6d3VFuek7T-v0lGW6B-kryxzMw`, nil},
+		{"ok/patched-rs", patchedRS, patchedRSJWK, []byte(`test-9067`), `ANq_zMtfaEYO5ln_SOSU5DWKfKLXxDM_sl0QPJbWUwAApnHIku6ulUSCJyY0i27uV9wKsatOAjc5vJ7-BJojJw`, nil},
+		{"fail/patched-r-wrong-jwk", patchedRWithWrongJWK, patchedRSJWK, nil, `rQPYKYflfKnlgBKqDeWsJH2TJ6iHAnou7sFzXlmYD4ArXqLfYuqotWERKrna2wfzh0pu7USWO2gzlOqRK9qq`, errors.New("go-jose/go-jose: error in cryptographic primitive")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expectedSignature, decodeErr := base64.RawURLEncoding.DecodeString(tt.expectedSignature)
+			require.NoError(t, decodeErr)
+
+			data, err := retryVerificationWithPatchedSignatures(tt.jws, tt.jwk)
+			if tt.expectedError != nil {
+				tassert.EqualError(t, err, tt.expectedError.Error())
+				tassert.Equal(t, expectedSignature, tt.jws.Signatures[0].Signature)
+				tassert.Empty(t, data)
+				return
+			}
+
+			tassert.NoError(t, err)
+			tassert.Len(t, tt.jws.Signatures[0].Signature, 64)
+			tassert.Equal(t, expectedSignature, tt.jws.Signatures[0].Signature)
+			tassert.Equal(t, tt.expectedData, data)
 		})
 	}
 }

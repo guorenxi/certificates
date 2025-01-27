@@ -23,6 +23,7 @@ func init() {
 type StepCAS struct {
 	iss         stepIssuer
 	client      *ca.Client
+	authorityID string
 	fingerprint string
 }
 
@@ -42,22 +43,31 @@ func New(ctx context.Context, opts apiv1.Options) (*StepCAS, error) {
 	}
 
 	// Create client.
-	client, err := ca.NewClient(opts.CertificateAuthority, ca.WithRootSHA256(opts.CertificateAuthorityFingerprint))
+	client, err := ca.NewClient(opts.CertificateAuthority, ca.WithRootSHA256(opts.CertificateAuthorityFingerprint)) //nolint:contextcheck // deeply nested context
 	if err != nil {
 		return nil, err
 	}
 
-	// Create configured issuer
-	iss, err := newStepIssuer(caURL, client, opts.CertificateIssuer)
-	if err != nil {
-		return nil, err
+	var iss stepIssuer
+	// Create configured issuer unless we only want to use GetCertificateAuthority.
+	// This avoid the request for the password if not provided.
+	if !opts.IsCAGetter {
+		if iss, err = newStepIssuer(ctx, caURL, client, opts.CertificateIssuer); err != nil {
+			return nil, err
+		}
 	}
 
 	return &StepCAS{
 		iss:         iss,
 		client:      client,
+		authorityID: opts.AuthorityID,
 		fingerprint: opts.CertificateAuthorityFingerprint,
 	}, nil
+}
+
+// Type returns the type of this CertificateAuthorityService.
+func (s *StepCAS) Type() apiv1.Type {
+	return apiv1.StepCAS
 }
 
 // CreateCertificate uses the step-ca sign request with the configured
@@ -66,11 +76,25 @@ func (s *StepCAS) CreateCertificate(req *apiv1.CreateCertificateRequest) (*apiv1
 	switch {
 	case req.CSR == nil:
 		return nil, errors.New("createCertificateRequest `csr` cannot be nil")
-	case req.Lifetime == 0:
-		return nil, errors.New("createCertificateRequest `lifetime` cannot be 0")
+	case req.Template == nil:
+		return nil, errors.New("createCertificateRequest `template` cannot be nil")
+	case req.Lifetime < 0:
+		return nil, errors.New("createCertificateRequest `lifetime` cannot be less than 0")
 	}
 
-	cert, chain, err := s.createCertificate(req.CSR, req.Lifetime)
+	info := &raInfo{
+		AuthorityID: s.authorityID,
+	}
+	if req.IsCAServerCert {
+		info.EndpointID = newServerEndpointID(s.authorityID).String()
+	}
+	if p := req.Provisioner; p != nil {
+		info.ProvisionerID = p.ID
+		info.ProvisionerType = p.Type
+		info.ProvisionerName = p.Name
+	}
+
+	cert, chain, err := s.createCertificate(req.CSR, req.Template, req.Lifetime, info)
 	if err != nil {
 		return nil, err
 	}
@@ -84,12 +108,30 @@ func (s *StepCAS) CreateCertificate(req *apiv1.CreateCertificateRequest) (*apiv1
 // RenewCertificate will always return a non-implemented error as mTLS renewals
 // are not supported yet.
 func (s *StepCAS) RenewCertificate(req *apiv1.RenewCertificateRequest) (*apiv1.RenewCertificateResponse, error) {
-	return nil, apiv1.ErrNotImplemented{Message: "stepCAS does not support mTLS renewals"}
+	if req.Token == "" {
+		return nil, apiv1.ValidationError{Message: "renewCertificateRequest `token` cannot be empty"}
+	}
+
+	resp, err := s.client.RenewWithToken(req.Token)
+	if err != nil {
+		return nil, err
+	}
+
+	var chain []*x509.Certificate
+	cert := resp.CertChainPEM[0].Certificate
+	for _, c := range resp.CertChainPEM[1:] {
+		chain = append(chain, c.Certificate)
+	}
+
+	return &apiv1.RenewCertificateResponse{
+		Certificate:      cert,
+		CertificateChain: chain,
+	}, nil
 }
 
+// RevokeCertificate revokes a certificate.
 func (s *StepCAS) RevokeCertificate(req *apiv1.RevokeCertificateRequest) (*apiv1.RevokeCertificateResponse, error) {
-	switch {
-	case req.SerialNumber == "" && req.Certificate == nil:
+	if req.SerialNumber == "" && req.Certificate == nil {
 		return nil, errors.New("revokeCertificateRequest `serialNumber` or `certificate` are required")
 	}
 
@@ -122,7 +164,7 @@ func (s *StepCAS) RevokeCertificate(req *apiv1.RevokeCertificateRequest) (*apiv1
 
 // GetCertificateAuthority returns the root certificate of the certificate
 // authority using the configured fingerprint.
-func (s *StepCAS) GetCertificateAuthority(req *apiv1.GetCertificateAuthorityRequest) (*apiv1.GetCertificateAuthorityResponse, error) {
+func (s *StepCAS) GetCertificateAuthority(*apiv1.GetCertificateAuthorityRequest) (*apiv1.GetCertificateAuthorityResponse, error) {
 	resp, err := s.client.Root(s.fingerprint)
 	if err != nil {
 		return nil, err
@@ -132,23 +174,23 @@ func (s *StepCAS) GetCertificateAuthority(req *apiv1.GetCertificateAuthorityRequ
 	}, nil
 }
 
-func (s *StepCAS) createCertificate(cr *x509.CertificateRequest, lifetime time.Duration) (*x509.Certificate, []*x509.Certificate, error) {
-	sans := make([]string, 0, len(cr.DNSNames)+len(cr.EmailAddresses)+len(cr.IPAddresses)+len(cr.URIs))
-	sans = append(sans, cr.DNSNames...)
-	sans = append(sans, cr.EmailAddresses...)
-	for _, ip := range cr.IPAddresses {
+func (s *StepCAS) createCertificate(cr *x509.CertificateRequest, template *x509.Certificate, lifetime time.Duration, raInfo *raInfo) (*x509.Certificate, []*x509.Certificate, error) {
+	sans := make([]string, 0, len(template.DNSNames)+len(template.EmailAddresses)+len(template.IPAddresses)+len(template.URIs))
+	sans = append(sans, template.DNSNames...)
+	sans = append(sans, template.EmailAddresses...)
+	for _, ip := range template.IPAddresses {
 		sans = append(sans, ip.String())
 	}
-	for _, u := range cr.URIs {
+	for _, u := range template.URIs {
 		sans = append(sans, u.String())
 	}
 
-	commonName := cr.Subject.CommonName
+	commonName := template.Subject.CommonName
 	if commonName == "" && len(sans) > 0 {
 		commonName = sans[0]
 	}
 
-	token, err := s.iss.SignToken(commonName, sans)
+	token, err := s.iss.SignToken(commonName, sans, raInfo)
 	if err != nil {
 		return nil, nil, err
 	}
